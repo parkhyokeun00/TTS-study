@@ -36,6 +36,7 @@ python tts_app.py
 - 참조 음성과 참조 텍스트를 넣으면 정밀 voice clone 가능
 - 참조 텍스트 없이 `x-vector only` 모드도 가능하지만 품질은 더 불안정할 수 있음
 - `voice prompt` 파일로 저장해두면 같은 목소리로 여러 문장을 반복 생성 가능
+- 자세한 설명서는 [TTS_GUIDE.md](/f:/abc/qwen-tts/TTS_GUIDE.md) 참고
 
 > ⚠️ `qwen-asr` 와 `qwen-tts` 는 `transformers` 버전 충돌 가능성이 있으므로 가급적 **별도 가상환경** 사용 권장
 >
