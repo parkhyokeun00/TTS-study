@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local model and cache artifacts
+models/
+outputs/
+.cache/
+.gradio/
+
+# Hugging Face / transformers
+hf_home/
+huggingface/
+
+# Generated audio and prompts
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.pt
+*.safetensors
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,21 @@
+# Core dependencies
+qwen-asr>=0.0.6
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# Audio processing
+soundfile>=0.12.0
+sounddevice>=0.4.0
+numpy>=1.24.0
+
+# GUI
+gradio>=4.0.0
+
+# Hotkey support
+keyboard>=0.13.0
+pyperclip>=1.8.0
+
+# Subtitle App
+soundcard>=0.4.2
+deep-translator>=1.11.4
+PyQt5>=5.15.9
