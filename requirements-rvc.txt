@@ -1,0 +1,10 @@
+-r requirements-tts.txt
+fairseq==0.12.2
+av<12
+praat-parselmouth
+pyworld
+torchcrepe==0.0.22
+faiss-cpu
+python-dotenv
+tensorboardx
+poethepoet<0.25

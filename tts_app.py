@@ -6,6 +6,7 @@ import gradio as gr
 
 from storage import configure_runtime_storage
 from tts import get_model_choices, resolve_server_name, resolve_server_port, tts_model
+from voice_conversion import voice_converter
 
 
 configure_runtime_storage()
@@ -51,10 +52,43 @@ def save_postprocess_preset_ui(preset_name, speed, pitch_semitones, ending_style
     return gr.Dropdown(choices=preset_names, value=selected_name), status
 
 
+def convert_voice_ui(
+    input_audio,
+    model_file,
+    index_file,
+    hubert_file,
+    rmvpe_file,
+    speaker_id,
+    pitch_shift,
+    f0_method,
+    index_rate,
+    filter_radius,
+    resample_sr,
+    rms_mix_rate,
+    protect,
+):
+    output_path, status = voice_converter.convert_voice(
+        input_audio=input_audio,
+        model_file=model_file,
+        index_file=index_file,
+        hubert_file=hubert_file,
+        rmvpe_file=rmvpe_file,
+        speaker_id=speaker_id,
+        pitch_shift=pitch_shift,
+        f0_method=f0_method,
+        index_rate=index_rate,
+        filter_radius=filter_radius,
+        resample_sr=resample_sr,
+        rms_mix_rate=rms_mix_rate,
+        protect=protect,
+    )
+    return output_path, status, voice_converter.get_runtime_status()
+
+
 def create_app():
     with gr.Blocks(title="Qwen3-TTS 음성 복제 스튜디오") as app:
         gr.HTML('<div class="title-text">Qwen3-TTS 음성 복제 스튜디오</div>')
-        gr.HTML('<div class="subtitle-text">한국어 원고를 로컬에서 음성으로 생성하고, 참조 음성으로 목소리를 복제합니다</div>')
+        gr.HTML('<div class="subtitle-text">한국어 TTS, voice clone, 그리고 실험적 RVC 음성 변조를 로컬에서 다룹니다</div>')
 
         with gr.Row():
             with gr.Column(scale=2):
@@ -251,6 +285,100 @@ def create_app():
                     prompt_postprocess_status = gr.Textbox(label="후처리 결과", interactive=False, lines=2)
                     prompt_processed_audio = gr.Audio(label="후처리 적용 음성", type="filepath")
 
+            with gr.Tab("음성 대 음성 변조 (RVC 실험)"):
+                gr.Markdown(
+                    "입력 음성의 내용은 유지한 채, RVC 모델의 목소리로 바꾸는 실험 탭입니다. "
+                    "Windows에서는 Python 3.10 가상환경을 권장합니다. "
+                    "설치 절차는 README의 RVC 섹션을 따르고, "
+                    "`hubert_base.pt`, `rmvpe.pt`, 대상 `*.pth` 모델을 준비해야 합니다."
+                )
+                vc_runtime_status = gr.Textbox(
+                    label="RVC 런타임 상태",
+                    value=voice_converter.get_runtime_status(),
+                    interactive=False,
+                    lines=6,
+                )
+                vc_refresh_btn = gr.Button("RVC 상태 새로고침")
+                vc_input_audio = gr.Audio(
+                    label="변조할 입력 음성",
+                    type="filepath",
+                    sources=["upload", "microphone"],
+                )
+                with gr.Row():
+                    vc_model_file = gr.File(
+                        label="RVC 모델 (.pth)",
+                        file_types=[".pth"],
+                        type="filepath",
+                    )
+                    vc_index_file = gr.File(
+                        label="Feature Index (.index, 선택)",
+                        file_types=[".index"],
+                        type="filepath",
+                    )
+                with gr.Row():
+                    vc_hubert_file = gr.File(
+                        label="HuBERT base (.pt, 선택)",
+                        file_types=[".pt"],
+                        type="filepath",
+                    )
+                    vc_rmvpe_file = gr.File(
+                        label="RMVPE (.pt, 선택)",
+                        file_types=[".pt"],
+                        type="filepath",
+                    )
+                with gr.Row():
+                    vc_speaker_id = gr.Number(label="화자 ID", value=0, precision=0)
+                    vc_pitch_shift = gr.Slider(
+                        minimum=-24,
+                        maximum=24,
+                        value=0,
+                        step=1,
+                        label="키 변경 (반음)",
+                    )
+                    vc_f0_method = gr.Dropdown(
+                        choices=voice_converter.F0_METHOD_CHOICES,
+                        value="rmvpe",
+                        label="F0 추출 방식",
+                    )
+                with gr.Row():
+                    vc_index_rate = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        value=0.75,
+                        step=0.05,
+                        label="Index 비율",
+                    )
+                    vc_filter_radius = gr.Slider(
+                        minimum=0,
+                        maximum=7,
+                        value=3,
+                        step=1,
+                        label="Filter Radius",
+                    )
+                with gr.Row():
+                    vc_resample_sr = gr.Dropdown(
+                        choices=[("모델 기본값", 0), ("32000 Hz", 32000), ("40000 Hz", 40000), ("48000 Hz", 48000)],
+                        value=0,
+                        label="출력 샘플레이트",
+                    )
+                    vc_rms_mix_rate = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        value=0.25,
+                        step=0.05,
+                        label="RMS Mix Rate",
+                    )
+                    vc_protect = gr.Slider(
+                        minimum=0.0,
+                        maximum=0.5,
+                        value=0.33,
+                        step=0.01,
+                        label="Protect",
+                    )
+                vc_convert_btn = gr.Button("음성 변조 실행", variant="primary")
+                vc_status = gr.Textbox(label="변조 결과", interactive=False, lines=5)
+                vc_output_audio = gr.Audio(label="변조된 음성", type="filepath")
+
         gr.Markdown(
             "주의: 본인 음성이나 사용 권한이 있는 음성만 사용하세요. "
             "ASR와 TTS는 의존성 충돌 가능성이 있어 별도 가상환경 사용을 권장합니다. "
@@ -325,6 +453,31 @@ def create_app():
             fn=tts_model.apply_postprocess_to_file,
             inputs=[prompt_audio_out, prompt_speed_slider, prompt_pitch_slider, prompt_ending_style, prompt_ending_length],
             outputs=[prompt_processed_audio, prompt_postprocess_status],
+        )
+
+        vc_refresh_btn.click(
+            fn=voice_converter.get_runtime_status,
+            outputs=[vc_runtime_status],
+        )
+
+        vc_convert_btn.click(
+            fn=convert_voice_ui,
+            inputs=[
+                vc_input_audio,
+                vc_model_file,
+                vc_index_file,
+                vc_hubert_file,
+                vc_rmvpe_file,
+                vc_speaker_id,
+                vc_pitch_shift,
+                vc_f0_method,
+                vc_index_rate,
+                vc_filter_radius,
+                vc_resample_sr,
+                vc_rms_mix_rate,
+                vc_protect,
+            ],
+            outputs=[vc_output_audio, vc_status, vc_runtime_status],
         )
 
     return app
