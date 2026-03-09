@@ -13,6 +13,10 @@ import tempfile
 import soundfile as sf
 import pyperclip
 from datetime import datetime
+from storage import configure_runtime_storage
+
+
+STORAGE_PATHS = configure_runtime_storage()
 
 
 class HotkeyRecorder:
@@ -98,7 +102,8 @@ class HotkeyRecorder:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         temp_file = tempfile.NamedTemporaryFile(
             suffix=f"_recording_{timestamp}.wav",
-            delete=False
+            delete=False,
+            dir=STORAGE_PATHS["tmp"],
         )
         sf.write(temp_file.name, audio_data, self.sample_rate)
         

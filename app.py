@@ -6,7 +6,11 @@ Gradio 기반 웹 인터페이스
 import os
 import socket
 import gradio as gr
+from storage import configure_runtime_storage
 from asr import get_model_choices, load_model, transcribe_file, transcribe_mic
+
+
+configure_runtime_storage()
 
 
 # CSS 스타일

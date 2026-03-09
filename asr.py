@@ -8,6 +8,10 @@ import numpy as np
 import tempfile
 import soundfile as sf
 from typing import Optional, Tuple
+from storage import configure_runtime_storage
+
+
+STORAGE_PATHS = configure_runtime_storage()
 
 
 class ASRModel:
@@ -67,12 +71,6 @@ class ASRModel:
             
             # qwen-asr 패키지에서 모델 로드
             from qwen_asr import Qwen3ASRModel
-            import os
-            
-            # 모델 저장 경로 설정 (프로젝트 폴더 내 models/)
-            models_dir = os.path.join(os.path.dirname(__file__), "models")
-            os.makedirs(models_dir, exist_ok=True)
-            os.environ["HF_HOME"] = models_dir
             
             dtype = torch.bfloat16 if "cuda" in self.device else torch.float32
             self.model = Qwen3ASRModel.from_pretrained(
