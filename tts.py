@@ -1231,6 +1231,37 @@ class TTSModel:
         except Exception as exc:
             return None, "", "", f"❌ 줄 미리듣기 실패: {type(exc).__name__}: {exc}"
 
+    def get_regenerate_line_defaults(
+        self,
+        job_dir: str,
+        selected_line: str,
+        speaker_rows,
+    ) -> Tuple[float, float, str, int, str]:
+        if not job_dir or not str(job_dir).strip():
+            return 1.0, 0.0, "default", 180, "먼저 다화자 대본을 생성해주세요."
+        if not selected_line or not str(selected_line).strip():
+            return 1.0, 0.0, "default", 180, "줄을 선택하면 재생성 기본값을 불러옵니다."
+
+        try:
+            speaker_configs = self._normalize_speaker_rows(speaker_rows)
+            manifest = self._read_manifest(job_dir)
+            line_id = self._parse_line_choice(selected_line)
+            line_entry = self._find_manifest_line(manifest, line_id)
+            speaker = line_entry.get("speaker", "")
+            config = speaker_configs.get(speaker)
+            if not config:
+                return 1.0, 0.0, "default", 180, f"화자 '{speaker}' 설정을 찾지 못했습니다."
+            options: PostprocessOptions = config["options"]
+            return (
+                float(options.speed),
+                float(options.pitch_semitones),
+                str(options.ending_style),
+                int(options.ending_length_ms),
+                f"✅ {line_id} 재생성 기본값 불러오기 완료",
+            )
+        except Exception as exc:
+            return 1.0, 0.0, "default", 180, f"❌ 재생성 기본값 불러오기 실패: {type(exc).__name__}: {exc}"
+
     def regenerate_multi_speaker_line(
         self,
         job_dir: str,
@@ -1239,6 +1270,10 @@ class TTSModel:
         language: str,
         merge_output: bool = True,
         silence_ms: int = 120,
+        speed: float = 1.0,
+        pitch_semitones: float = 0.0,
+        ending_style: str = "default",
+        ending_length_ms: int = 180,
     ) -> Tuple[Optional[str], Optional[str], List[str], str, List[List[Any]], gr.Dropdown]:
         if self.model is None:
             return None, None, [], "❌ 먼저 TTS 모델을 로드해주세요!", [], gr.Dropdown(choices=[], value=None)
@@ -1257,12 +1292,18 @@ class TTSModel:
                 raise ValueError(f"화자 '{speaker}'의 설정이 현재 표에 없습니다.")
 
             speaker_config = speaker_configs[speaker]
+            override_options = PostprocessOptions(
+                speed=float(speed),
+                pitch_semitones=float(pitch_semitones),
+                ending_style=str(ending_style),
+                ending_length_ms=int(ending_length_ms),
+            )
             version_id, version_index = self._next_line_version(line_entry)
             processed_wav, sample_rate, chunk_count = self._render_line_with_prompt(
                 text=line_entry.get("text", ""),
                 language=language,
                 prompt_path=speaker_config["prompt_path"],
-                options=speaker_config["options"],
+                options=override_options,
             )
             line_number = int(re.sub(r"\D", "", line_id) or "0")
             file_name = self._build_multi_speaker_filename(
@@ -1323,7 +1364,8 @@ class TTSModel:
             status = (
                 f"✅ {line_id} 다시 생성 완료\n"
                 f"화자: {speaker}\n"
-                f"새 버전: {version_id} ({version_index}번째 렌더)"
+                f"새 버전: {version_id} ({version_index}번째 렌더)\n"
+                f"적용값: speed={override_options.speed:.2f}, pitch={override_options.pitch_semitones:.1f}, ending={override_options.ending_style}"
             )
             return line_path, final_mix_path, output_files, status, result_rows, line_dropdown
         except Exception as exc:

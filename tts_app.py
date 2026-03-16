@@ -774,6 +774,34 @@ def create_app():
                     with gr.Row():
                         multi_line_speaker = gr.Textbox(label="선택 줄 화자", interactive=False)
                         multi_line_text = gr.Textbox(label="선택 줄 대사", interactive=False, lines=3)
+                    with gr.Row():
+                        multi_regen_speed = gr.Slider(
+                            minimum=0.7,
+                            maximum=1.4,
+                            value=1.0,
+                            step=0.05,
+                            label="재생성 속도",
+                        )
+                        multi_regen_pitch = gr.Slider(
+                            minimum=-4.0,
+                            maximum=4.0,
+                            value=0.0,
+                            step=0.5,
+                            label="재생성 피치",
+                        )
+                    with gr.Row():
+                        multi_regen_ending_style = gr.Dropdown(
+                            choices=ENDING_STYLE_CHOICES,
+                            value="default",
+                            label="재생성 끝음 처리",
+                        )
+                        multi_regen_ending_length = gr.Slider(
+                            minimum=80,
+                            maximum=1200,
+                            value=180,
+                            step=20,
+                            label="재생성 끝음 길이(ms)",
+                        )
 
             with gr.Tab("음성 대 음성 변조 (RVC 실험)"):
                 gr.Markdown(
@@ -972,6 +1000,11 @@ def create_app():
             outputs=[multi_line_audio, multi_line_speaker, multi_line_text, multi_line_status],
         )
 
+        multi_extract_btn.click(
+            fn=lambda: (1.0, 0.0, "default", 180),
+            outputs=[multi_regen_speed, multi_regen_pitch, multi_regen_ending_style, multi_regen_ending_length],
+        )
+
         multi_refresh_prompts_btn.click(
             fn=refresh_card_prompt_choices_ui,
             outputs=[*[card["prompt_library"] for card in multi_card_components], multi_editor_status],
@@ -1018,6 +1051,12 @@ def create_app():
             outputs=[multi_line_audio, multi_line_speaker, multi_line_text, multi_line_status],
         )
 
+        multi_line_selector.change(
+            fn=tts_model.get_regenerate_line_defaults,
+            inputs=[multi_job_dir_state, multi_line_selector, multi_speaker_table],
+            outputs=[multi_regen_speed, multi_regen_pitch, multi_regen_ending_style, multi_regen_ending_length, multi_line_status],
+        )
+
         multi_regenerate_btn.click(
             fn=tts_model.regenerate_multi_speaker_line,
             inputs=[
@@ -1027,6 +1066,10 @@ def create_app():
                 language_dropdown,
                 multi_make_mix,
                 multi_silence_ms,
+                multi_regen_speed,
+                multi_regen_pitch,
+                multi_regen_ending_style,
+                multi_regen_ending_length,
             ],
             outputs=[
                 multi_line_audio,
