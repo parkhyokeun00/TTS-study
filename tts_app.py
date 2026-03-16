@@ -181,6 +181,41 @@ def convert_voice_ui(
     return output_path, status, voice_converter.get_runtime_status()
 
 
+def convert_voice_folder_ui(
+    input_folder,
+    output_subfolder_name,
+    model_file,
+    index_file,
+    hubert_file,
+    rmvpe_file,
+    speaker_id,
+    pitch_shift,
+    f0_method,
+    index_rate,
+    filter_radius,
+    resample_sr,
+    rms_mix_rate,
+    protect,
+):
+    output_files, status, output_dir = voice_converter.convert_voice_folder(
+        input_folder=input_folder,
+        output_subfolder_name=output_subfolder_name,
+        model_file=model_file,
+        index_file=index_file,
+        hubert_file=hubert_file,
+        rmvpe_file=rmvpe_file,
+        speaker_id=speaker_id,
+        pitch_shift=pitch_shift,
+        f0_method=f0_method,
+        index_rate=index_rate,
+        filter_radius=filter_radius,
+        resample_sr=resample_sr,
+        rms_mix_rate=rms_mix_rate,
+        protect=protect,
+    )
+    return output_files, status, output_dir, voice_converter.get_runtime_status()
+
+
 def extract_multi_speaker_rows_ui(script_text):
     rows, status = tts_model.build_multi_speaker_rows(script_text)
     return rows, status
@@ -901,6 +936,21 @@ def create_app():
                 vc_convert_btn = gr.Button("음성 변조 실행", variant="primary")
                 vc_status = gr.Textbox(label="변조 결과", interactive=False, lines=5)
                 vc_output_audio = gr.Audio(label="변조된 음성", type="filepath")
+                with gr.Accordion("폴더 일괄 변조", open=False):
+                    vc_input_folder = gr.Textbox(
+                        label="변조할 음성 폴더 경로",
+                        placeholder=r"예: F:\abc\qwen-tts\inputs\rvc_batch",
+                        info="이 폴더 바로 아래의 오디오 파일들을 한 번에 변조합니다.",
+                    )
+                    vc_output_subfolder = gr.Textbox(
+                        label="저장 하위 폴더 이름",
+                        placeholder="비워두면 날짜_입력폴더명으로 자동 생성",
+                        info=r"저장 위치: F:\abc\qwen-tts\outputs\voice_conversion\<여기에 입력한 이름>",
+                    )
+                    vc_batch_convert_btn = gr.Button("폴더 일괄 변조 실행", variant="primary")
+                    vc_batch_status = gr.Textbox(label="일괄 변조 결과", interactive=False, lines=6)
+                    vc_batch_output_dir = gr.Textbox(label="일괄 저장 폴더", interactive=False)
+                    vc_batch_output_files = gr.File(label="일괄 변조 파일", file_count="multiple")
 
         gr.Markdown(
             "주의: 본인 음성이나 사용 권한이 있는 음성만 사용하세요. "
@@ -1116,6 +1166,27 @@ def create_app():
                 vc_protect,
             ],
             outputs=[vc_output_audio, vc_status, vc_runtime_status],
+        )
+
+        vc_batch_convert_btn.click(
+            fn=convert_voice_folder_ui,
+            inputs=[
+                vc_input_folder,
+                vc_output_subfolder,
+                vc_model_file,
+                vc_index_file,
+                vc_hubert_file,
+                vc_rmvpe_file,
+                vc_speaker_id,
+                vc_pitch_shift,
+                vc_f0_method,
+                vc_index_rate,
+                vc_filter_radius,
+                vc_resample_sr,
+                vc_rms_mix_rate,
+                vc_protect,
+            ],
+            outputs=[vc_batch_output_files, vc_batch_status, vc_batch_output_dir, vc_runtime_status],
         )
 
     return app

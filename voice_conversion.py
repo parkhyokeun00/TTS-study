@@ -9,7 +9,8 @@ import re
 import shutil
 import traceback
 import uuid
-from typing import Optional, Tuple
+from datetime import datetime
+from typing import List, Optional, Tuple
 
 import librosa
 import numpy as np
@@ -52,6 +53,7 @@ def ensure_rvc_dirs() -> None:
 
 class RVCVoiceConverter:
     F0_METHOD_CHOICES = ["rmvpe", "harvest", "pm", "crepe"]
+    AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wma"}
 
     def __init__(self) -> None:
         ensure_rvc_dirs()
@@ -179,11 +181,111 @@ class RVCVoiceConverter:
         )
 
     def _save_output_audio(self, source_audio_path: str, audio, sample_rate: int) -> str:
+        return self._save_output_audio_to_dir(source_audio_path, audio, sample_rate, RVC_OUTPUT_DIR)
+
+    def _save_output_audio_to_dir(self, source_audio_path: str, audio, sample_rate: int, output_dir: str) -> str:
+        os.makedirs(output_dir, exist_ok=True)
         stem = os.path.splitext(os.path.basename(source_audio_path))[0]
         stem = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "", stem) or "voice_conversion"
-        output_path = os.path.join(RVC_OUTPUT_DIR, f"{stem}_rvc_{uuid.uuid4().hex[:8]}.wav")
+        output_path = os.path.join(output_dir, f"{stem}_rvc_{uuid.uuid4().hex[:8]}.wav")
         sf.write(output_path, audio, sample_rate)
         return output_path
+
+    def _sanitize_output_name(self, value: str, fallback: str) -> str:
+        cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "", (value or "").strip())
+        cleaned = re.sub(r"\s+", "_", cleaned)
+        cleaned = re.sub(r"_+", "_", cleaned).strip("._ ")
+        return cleaned[:80] or fallback
+
+    def _prepare_conversion(
+        self,
+        model_file,
+        index_file=None,
+        hubert_file=None,
+        rmvpe_file=None,
+        f0_method: str = "rmvpe",
+        protect: float = 0.33,
+    ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[float], Optional[str]]:
+        if VC is None:
+            return None, None, None, None, self.get_runtime_status()
+
+        model_path = self._copy_if_needed(self._resolve_file_path(model_file), RVC_WEIGHTS_DIR)
+        if not model_path or not model_path.endswith(".pth"):
+            return None, None, None, None, "❌ RVC 모델(.pth) 파일이 필요합니다."
+
+        explicit_index_path = self._copy_if_needed(self._resolve_file_path(index_file), RVC_INDICES_DIR)
+        hubert_path = self._copy_if_needed(self._resolve_file_path(hubert_file), RVC_HUBERT_DIR) or self._default_hubert_path()
+        rmvpe_path = self._copy_if_needed(self._resolve_file_path(rmvpe_file), RVC_RMVPE_DIR) or self._default_rmvpe_path()
+
+        if not hubert_path:
+            return None, None, None, None, (
+                "❌ HuBERT base 모델이 없습니다.\n"
+                f"파일을 업로드하거나 {RVC_HUBERT_DIR} 에 hubert_base.pt 를 배치하세요."
+            )
+
+        if f0_method == "rmvpe" and not rmvpe_path:
+            return None, None, None, None, (
+                "❌ RMVPE 모델이 없습니다.\n"
+                f"파일을 업로드하거나 {RVC_RMVPE_DIR} 에 rmvpe.pt 를 배치하세요."
+            )
+
+        self._configure_environment(hubert_path)
+        self._apply_runtime_compat_patches()
+        auto_index_path, protect_value = self._ensure_model_loaded(model_path, float(protect))
+        if protect_value is None:
+            return None, None, None, None, f"❌ RVC 모델 로드 실패: {os.path.basename(model_path)}\n{self.last_error or ''}".strip()
+        chosen_index_path = explicit_index_path or auto_index_path
+        return model_path, chosen_index_path, hubert_path, protect_value, None
+
+    def _convert_audio_path(
+        self,
+        input_audio_path: str,
+        model_path: str,
+        chosen_index_path: Optional[str],
+        hubert_path: str,
+        speaker_id: int = 0,
+        pitch_shift: int = 0,
+        f0_method: str = "rmvpe",
+        index_rate: float = 0.75,
+        filter_radius: int = 3,
+        resample_sr: int = 0,
+        rms_mix_rate: float = 0.25,
+        protect: float = 0.33,
+        output_dir: Optional[str] = None,
+    ) -> Tuple[Optional[str], str]:
+        try:
+            target_sr, audio_opt, times, error = self.vc.vc_inference(
+                sid=int(speaker_id),
+                input_audio_path=input_audio_path,
+                f0_up_key=int(pitch_shift),
+                f0_method=str(f0_method),
+                index_file=chosen_index_path,
+                index_rate=float(index_rate),
+                filter_radius=int(filter_radius),
+                resample_sr=int(resample_sr),
+                rms_mix_rate=float(rms_mix_rate),
+                protect=float(protect),
+                hubert_path=hubert_path,
+            )
+            if error or target_sr is None or audio_opt is None:
+                return None, f"❌ 음성 변조 실패\n{error or '알 수 없는 오류'}"
+
+            save_dir = output_dir or RVC_OUTPUT_DIR
+            output_path = self._save_output_audio_to_dir(input_audio_path, audio_opt, int(target_sr), save_dir)
+            index_label = os.path.basename(chosen_index_path) if chosen_index_path else "미사용"
+            timing_label = ""
+            if isinstance(times, dict):
+                timing_label = f"\n처리 시간 단서: npy={times.get('npy', 0):.2f}, f0={times.get('f0', 0):.2f}, infer={times.get('infer', 0):.2f}"
+            return (
+                output_path,
+                "✅ 음성 변조 완료\n"
+                f"모델: {os.path.basename(model_path)}\n"
+                f"Index: {index_label}\n"
+                f"샘플레이트: {target_sr}Hz"
+                f"{timing_label}",
+            )
+        except Exception as exc:
+            return None, f"❌ 음성 변조 실패: {type(exc).__name__}: {exc}"
 
     def _ensure_model_loaded(self, model_path: str, protect: float) -> Tuple[Optional[str], Optional[float]]:
         try:
@@ -214,73 +316,118 @@ class RVCVoiceConverter:
         rms_mix_rate: float = 0.25,
         protect: float = 0.33,
     ) -> Tuple[Optional[str], str]:
-        if VC is None:
-            return None, self.get_runtime_status()
-
         input_audio_path = self._resolve_file_path(input_audio)
         if not input_audio_path:
             return None, "❌ 변조할 입력 음성을 업로드하거나 녹음해주세요."
+        model_path, chosen_index_path, hubert_path, protect_value, error_message = self._prepare_conversion(
+            model_file=model_file,
+            index_file=index_file,
+            hubert_file=hubert_file,
+            rmvpe_file=rmvpe_file,
+            f0_method=str(f0_method),
+            protect=float(protect),
+        )
+        if error_message:
+            return None, error_message
+        return self._convert_audio_path(
+            input_audio_path=input_audio_path,
+            model_path=str(model_path),
+            chosen_index_path=chosen_index_path,
+            hubert_path=str(hubert_path),
+            speaker_id=int(speaker_id),
+            pitch_shift=int(pitch_shift),
+            f0_method=str(f0_method),
+            index_rate=float(index_rate),
+            filter_radius=int(filter_radius),
+            resample_sr=int(resample_sr),
+            rms_mix_rate=float(rms_mix_rate),
+            protect=float(protect_value),
+        )
 
-        model_path = self._copy_if_needed(self._resolve_file_path(model_file), RVC_WEIGHTS_DIR)
-        if not model_path or not model_path.endswith(".pth"):
-            return None, "❌ RVC 모델(.pth) 파일이 필요합니다."
+    def convert_voice_folder(
+        self,
+        input_folder: str,
+        model_file,
+        index_file=None,
+        hubert_file=None,
+        rmvpe_file=None,
+        speaker_id: int = 0,
+        pitch_shift: int = 0,
+        f0_method: str = "rmvpe",
+        index_rate: float = 0.75,
+        filter_radius: int = 3,
+        resample_sr: int = 0,
+        rms_mix_rate: float = 0.25,
+        protect: float = 0.33,
+        output_subfolder_name: str = "",
+    ) -> Tuple[List[str], str, str]:
+        folder_path = os.path.abspath(str(input_folder or "").strip())
+        if not folder_path:
+            return [], "❌ 변조할 음성 폴더 경로를 입력해주세요.", ""
+        if not os.path.isdir(folder_path):
+            return [], f"❌ 폴더를 찾을 수 없습니다: {folder_path}", ""
 
-        explicit_index_path = self._copy_if_needed(self._resolve_file_path(index_file), RVC_INDICES_DIR)
-        hubert_path = self._copy_if_needed(self._resolve_file_path(hubert_file), RVC_HUBERT_DIR) or self._default_hubert_path()
-        rmvpe_path = self._copy_if_needed(self._resolve_file_path(rmvpe_file), RVC_RMVPE_DIR) or self._default_rmvpe_path()
+        model_path, chosen_index_path, hubert_path, protect_value, error_message = self._prepare_conversion(
+            model_file=model_file,
+            index_file=index_file,
+            hubert_file=hubert_file,
+            rmvpe_file=rmvpe_file,
+            f0_method=str(f0_method),
+            protect=float(protect),
+        )
+        if error_message:
+            return [], error_message, ""
 
-        if not hubert_path:
-            return None, (
-                "❌ HuBERT base 모델이 없습니다.\n"
-                f"파일을 업로드하거나 {RVC_HUBERT_DIR} 에 hubert_base.pt 를 배치하세요."
-            )
+        input_files = sorted(
+            os.path.join(folder_path, name)
+            for name in os.listdir(folder_path)
+            if os.path.isfile(os.path.join(folder_path, name)) and os.path.splitext(name)[1].lower() in self.AUDIO_EXTENSIONS
+        )
+        if not input_files:
+            supported = ", ".join(sorted(self.AUDIO_EXTENSIONS))
+            return [], f"❌ 폴더 안에 변조할 오디오 파일이 없습니다. 지원 형식: {supported}", ""
 
-        if f0_method == "rmvpe" and not rmvpe_path:
-            return None, (
-                "❌ RMVPE 모델이 없습니다.\n"
-                f"파일을 업로드하거나 {RVC_RMVPE_DIR} 에 rmvpe.pt 를 배치하세요."
-            )
+        base_name = self._sanitize_output_name(
+            output_subfolder_name,
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self._sanitize_output_name(os.path.basename(folder_path), 'batch')}",
+        )
+        output_dir = os.path.join(RVC_OUTPUT_DIR, base_name)
+        os.makedirs(output_dir, exist_ok=True)
 
-        self._configure_environment(hubert_path)
-        self._apply_runtime_compat_patches()
-
-        try:
-            auto_index_path, protect_value = self._ensure_model_loaded(model_path, float(protect))
-            if protect_value is None:
-                return None, f"❌ RVC 모델 로드 실패: {os.path.basename(model_path)}\n{self.last_error or ''}".strip()
-
-            chosen_index_path = explicit_index_path or auto_index_path
-            target_sr, audio_opt, times, error = self.vc.vc_inference(
-                sid=int(speaker_id),
+        output_files: List[str] = []
+        failed_items: List[str] = []
+        for input_audio_path in input_files:
+            converted_path, status = self._convert_audio_path(
                 input_audio_path=input_audio_path,
-                f0_up_key=int(pitch_shift),
+                model_path=str(model_path),
+                chosen_index_path=chosen_index_path,
+                hubert_path=str(hubert_path),
+                speaker_id=int(speaker_id),
+                pitch_shift=int(pitch_shift),
                 f0_method=str(f0_method),
-                index_file=chosen_index_path,
                 index_rate=float(index_rate),
                 filter_radius=int(filter_radius),
                 resample_sr=int(resample_sr),
                 rms_mix_rate=float(rms_mix_rate),
                 protect=float(protect_value),
-                hubert_path=hubert_path,
+                output_dir=output_dir,
             )
-            if error or target_sr is None or audio_opt is None:
-                return None, f"❌ 음성 변조 실패\n{error or '알 수 없는 오류'}"
+            if converted_path:
+                output_files.append(converted_path)
+            else:
+                failed_items.append(f"{os.path.basename(input_audio_path)} -> {status}")
 
-            output_path = self._save_output_audio(input_audio_path, audio_opt, int(target_sr))
-            index_label = os.path.basename(chosen_index_path) if chosen_index_path else "미사용"
-            timing_label = ""
-            if isinstance(times, dict):
-                timing_label = f"\n처리 시간 단서: npy={times.get('npy', 0):.2f}, f0={times.get('f0', 0):.2f}, infer={times.get('infer', 0):.2f}"
-            return (
-                output_path,
-                "✅ 음성 변조 완료\n"
-                f"모델: {os.path.basename(model_path)}\n"
-                f"Index: {index_label}\n"
-                f"샘플레이트: {target_sr}Hz"
-                f"{timing_label}",
-            )
-        except Exception as exc:
-            return None, f"❌ 음성 변조 실패: {type(exc).__name__}: {exc}"
+        status_lines = [
+            "✅ 폴더 일괄 음성 변조 완료",
+            f"입력 폴더: {folder_path}",
+            f"저장 폴더: {output_dir}",
+            f"성공: {len(output_files)}개 / 전체: {len(input_files)}개",
+        ]
+        if failed_items:
+            preview = "\n".join(failed_items[:5])
+            status_lines.append(f"실패: {len(failed_items)}개")
+            status_lines.append(preview)
+        return output_files, "\n".join(status_lines), output_dir
 
 
 voice_converter = RVCVoiceConverter()
