@@ -331,3 +331,8 @@ python tts_app.py
 - [tts.py](/f:/abc/qwen-tts/tts.py): 모델 로딩, voice clone, prompt 저장/재사용
 - [README.md](/f:/abc/qwen-tts/README.md): 프로젝트 개요
 
+
+
+
+실행법
+.\.venv-rvc\Scripts\python.exe tts_app.py
