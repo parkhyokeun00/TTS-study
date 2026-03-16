@@ -85,6 +85,11 @@ def convert_voice_ui(
     return output_path, status, voice_converter.get_runtime_status()
 
 
+def extract_multi_speaker_rows_ui(script_text):
+    rows, status = tts_model.build_multi_speaker_rows(script_text)
+    return rows, status
+
+
 def create_app():
     with gr.Blocks(title="Qwen3-TTS 음성 복제 스튜디오") as app:
         gr.HTML('<div class="title-text">Qwen3-TTS 음성 복제 스튜디오</div>')
@@ -285,6 +290,73 @@ def create_app():
                     prompt_postprocess_status = gr.Textbox(label="후처리 결과", interactive=False, lines=2)
                     prompt_processed_audio = gr.Audio(label="후처리 적용 음성", type="filepath")
 
+            with gr.Tab("다화자 대본 생성"):
+                gr.Markdown(
+                    "긴 대본을 `화자: 대사` 형식으로 입력한 뒤, 화자를 추출해서 각 화자에 맞는 "
+                    "`voice prompt(.pt)` 경로를 지정하면 줄별 음성과 최종 합본을 로컬에 저장합니다."
+                )
+                multi_script_input = gr.Textbox(
+                    label="대본 입력",
+                    lines=12,
+                    placeholder=(
+                        "예:\n"
+                        "나레이터: 오늘은 새로운 기능을 소개합니다.\n"
+                        "여자1: 첫 번째 장면을 시작하겠습니다.\n"
+                        "남자1: 다음 내용을 이어서 설명하겠습니다."
+                    ),
+                )
+                with gr.Row():
+                    multi_extract_btn = gr.Button("화자 추출", variant="secondary")
+                    multi_generate_btn = gr.Button("다화자 음성 생성", variant="primary")
+                multi_status = gr.Textbox(
+                    label="상태 / 안내",
+                    interactive=False,
+                    lines=5,
+                    value="대본을 입력하고 `화자 추출`을 누르세요.",
+                )
+                with gr.Row():
+                    multi_job_name = gr.Textbox(
+                        label="작업 이름",
+                        value="multi_speaker_demo",
+                        placeholder="예: story_episode_01",
+                    )
+                    multi_silence_ms = gr.Slider(
+                        minimum=0,
+                        maximum=1500,
+                        value=120,
+                        step=20,
+                        label="줄 사이 무음(ms)",
+                    )
+                with gr.Row():
+                    multi_save_lines = gr.Checkbox(label="줄별 파일 목록에 포함", value=True)
+                    multi_make_mix = gr.Checkbox(label="최종 합본 생성", value=True)
+
+                multi_speaker_table = gr.Dataframe(
+                    headers=["speaker", "prompt_path", "speed", "pitch", "ending_style", "ending_length_ms"],
+                    datatype=["str", "str", "number", "number", "str", "number"],
+                    row_count=(1, "dynamic"),
+                    column_count=(6, "fixed"),
+                    interactive=True,
+                    wrap=True,
+                    label="화자별 설정 표",
+                    value=[["나레이터", "", 1.0, 0.0, "default", 180]],
+                )
+                gr.Markdown(
+                    "`prompt_path`에는 로컬의 `voice prompt(.pt)` 경로를 직접 넣어주세요. "
+                    "`ending_style`은 `default`, `soften`, `fade`, `hold`, `natural` 중 하나를 사용합니다."
+                )
+                multi_result_table = gr.Dataframe(
+                    headers=["line_id", "speaker", "text", "status", "audio_path", "chunks"],
+                    datatype=["str", "str", "str", "str", "str", "number"],
+                    row_count=(0, "dynamic"),
+                    column_count=(6, "fixed"),
+                    interactive=False,
+                    wrap=True,
+                    label="줄별 생성 결과",
+                )
+                multi_final_audio = gr.Audio(label="최종 합본", type="filepath")
+                multi_output_files = gr.Files(label="생성된 파일")
+
             with gr.Tab("음성 대 음성 변조 (RVC 실험)"):
                 gr.Markdown(
                     "입력 음성의 내용은 유지한 채, RVC 모델의 목소리로 바꾸는 실험 탭입니다. "
@@ -453,6 +525,26 @@ def create_app():
             fn=tts_model.apply_postprocess_to_file,
             inputs=[prompt_audio_out, prompt_speed_slider, prompt_pitch_slider, prompt_ending_style, prompt_ending_length],
             outputs=[prompt_processed_audio, prompt_postprocess_status],
+        )
+
+        multi_extract_btn.click(
+            fn=extract_multi_speaker_rows_ui,
+            inputs=[multi_script_input],
+            outputs=[multi_speaker_table, multi_status],
+        )
+
+        multi_generate_btn.click(
+            fn=tts_model.generate_multi_speaker_script,
+            inputs=[
+                multi_script_input,
+                multi_speaker_table,
+                language_dropdown,
+                multi_job_name,
+                multi_save_lines,
+                multi_make_mix,
+                multi_silence_ms,
+            ],
+            outputs=[multi_final_audio, multi_output_files, multi_status, multi_result_table],
         )
 
         vc_refresh_btn.click(

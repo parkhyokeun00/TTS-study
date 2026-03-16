@@ -10,9 +10,10 @@ import socket
 import tempfile
 import uuid
 import json
+from datetime import datetime
 from dataclasses import asdict, dataclass
 from importlib.util import find_spec
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -36,6 +37,14 @@ class PostprocessOptions:
     pitch_semitones: float = 0.0
     ending_style: str = "default"
     ending_length_ms: int = 180
+
+
+@dataclass
+class MultiSpeakerLine:
+    line_id: str
+    line_index: int
+    speaker: str
+    text: str
 
 
 class TTSModel:
@@ -153,6 +162,15 @@ class TTSModel:
         cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "", cleaned)
         return cleaned[:40]
 
+    def _sanitize_filename_part(self, value: str, fallback: str) -> str:
+        cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "", (value or "").strip())
+        cleaned = re.sub(r"\s+", "_", cleaned)
+        cleaned = re.sub(r"_+", "_", cleaned).strip("._ ")
+        return cleaned[:80] or fallback
+
+    def _sanitize_project_name(self, name: str) -> str:
+        return self._sanitize_filename_part(name, "multi_speaker_job")
+
     def _default_postprocess_presets(self) -> dict:
         return {
             "기본": asdict(PostprocessOptions()),
@@ -232,6 +250,12 @@ class TTSModel:
         if not file_input:
             return None
         return getattr(file_input, "name", None) or getattr(file_input, "path", None) or str(file_input)
+
+    def _load_voice_prompt_items(self, prompt_path: str):
+        payload = torch.load(prompt_path, map_location="cpu", weights_only=True)
+        if not isinstance(payload, dict) or "items" not in payload:
+            raise ValueError("올바른 voice prompt 파일이 아닙니다.")
+        return [VoiceClonePromptItem(**item) for item in payload["items"]]
 
     def _resample_linear(self, wav: np.ndarray, target_length: int) -> np.ndarray:
         if target_length <= 1 or len(wav) <= 1:
@@ -414,6 +438,243 @@ class TTSModel:
     def _estimate_max_new_tokens(self, text: str) -> int:
         return min(2048, max(512, len(text) * 12))
 
+    def parse_script_lines(self, script_text: str) -> List[MultiSpeakerLine]:
+        if not script_text or not script_text.strip():
+            raise ValueError("대본을 입력해주세요.")
+
+        parsed_lines: List[MultiSpeakerLine] = []
+        raw_lines = script_text.splitlines()
+
+        for source_index, raw_line in enumerate(raw_lines, start=1):
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            if ":" not in stripped:
+                raise ValueError(f"{source_index}번째 줄에 ':' 구분자가 없습니다.")
+
+            speaker, text = stripped.split(":", 1)
+            speaker = speaker.strip()
+            text = text.strip()
+            if not speaker:
+                raise ValueError(f"{source_index}번째 줄에 화자 이름이 비어 있습니다.")
+            if not text:
+                raise ValueError(f"{source_index}번째 줄의 대사가 비어 있습니다.")
+
+            line_index = len(parsed_lines) + 1
+            parsed_lines.append(
+                MultiSpeakerLine(
+                    line_id=f"line_{line_index:03d}",
+                    line_index=line_index,
+                    speaker=speaker,
+                    text=text,
+                )
+            )
+
+        if not parsed_lines:
+            raise ValueError("유효한 대본 줄이 없습니다.")
+
+        return parsed_lines
+
+    def build_multi_speaker_rows(self, script_text: str) -> Tuple[List[List[Any]], str]:
+        try:
+            parsed_lines = self.parse_script_lines(script_text)
+        except ValueError as exc:
+            return [], f"❌ {exc}"
+
+        seen = set()
+        rows: List[List[Any]] = []
+        for line in parsed_lines:
+            if line.speaker in seen:
+                continue
+            seen.add(line.speaker)
+            rows.append([line.speaker, "", 1.0, 0.0, "default", 180])
+
+        return rows, f"✅ 화자 {len(rows)}명 추출 완료 / 대사 {len(parsed_lines)}줄"
+
+    def _normalize_speaker_rows(self, speaker_rows) -> Dict[str, Dict[str, Any]]:
+        if speaker_rows is None:
+            raise ValueError("화자 설정 표가 비어 있습니다.")
+
+        if hasattr(speaker_rows, "fillna") and hasattr(speaker_rows, "values"):
+            speaker_rows = speaker_rows.fillna("").values.tolist()
+        elif isinstance(speaker_rows, tuple):
+            speaker_rows = list(speaker_rows)
+
+        if not isinstance(speaker_rows, list) or not speaker_rows:
+            raise ValueError("화자 설정 표가 비어 있습니다.")
+
+        configs: Dict[str, Dict[str, Any]] = {}
+        for index, row in enumerate(speaker_rows, start=1):
+            if not row or all((str(cell).strip() == "" for cell in row if cell is not None)):
+                continue
+
+            speaker = str(row[0]).strip() if len(row) > 0 and row[0] is not None else ""
+            prompt_path = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+            if not speaker:
+                raise ValueError(f"화자 설정 {index}행의 화자 이름이 비어 있습니다.")
+            if not prompt_path:
+                raise ValueError(f"화자 '{speaker}'의 voice prompt 경로를 입력해주세요.")
+            if not os.path.exists(prompt_path):
+                raise ValueError(f"화자 '{speaker}'의 voice prompt 파일이 없습니다: {prompt_path}")
+
+            ending_style = str(row[4]).strip() if len(row) > 4 and row[4] is not None else "default"
+            if ending_style not in {"default", "soften", "fade", "hold", "natural"}:
+                raise ValueError(f"화자 '{speaker}'의 끝음 처리 값이 올바르지 않습니다: {ending_style}")
+
+            configs[speaker] = {
+                "prompt_path": prompt_path,
+                "options": PostprocessOptions(
+                    speed=float(row[2]) if len(row) > 2 and row[2] is not None else 1.0,
+                    pitch_semitones=float(row[3]) if len(row) > 3 and row[3] is not None else 0.0,
+                    ending_style=ending_style,
+                    ending_length_ms=int(float(row[5])) if len(row) > 5 and row[5] is not None else 180,
+                ),
+            }
+
+        if not configs:
+            raise ValueError("유효한 화자 설정이 없습니다.")
+
+        return configs
+
+    def _create_multi_speaker_job_dir(self, job_name: str) -> str:
+        safe_name = self._sanitize_project_name(job_name or "multi_speaker_job")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        job_dir = os.path.join(self.output_dir, "multi_speaker", f"{timestamp}_{safe_name}")
+        os.makedirs(job_dir, exist_ok=True)
+        return job_dir
+
+    def _save_wav_to_path(self, wav: np.ndarray, sample_rate: int, path: str) -> str:
+        sf.write(path, wav, sample_rate)
+        return path
+
+    def _merge_wavs_with_silence(self, wavs: List[np.ndarray], sample_rate: int, silence_ms: int) -> np.ndarray:
+        if not wavs:
+            return np.zeros(0, dtype=np.float32)
+        return self._concat_wavs(wavs, sample_rate, silence_ms=max(0, int(silence_ms)))
+
+    def generate_multi_speaker_script(
+        self,
+        script_text: str,
+        speaker_rows,
+        language: str,
+        job_name: str = "",
+        save_line_files: bool = True,
+        merge_output: bool = True,
+        silence_ms: int = 120,
+    ) -> Tuple[Optional[str], List[str], str, List[List[Any]]]:
+        if self.model is None:
+            return None, [], "❌ 먼저 TTS 모델을 로드해주세요!", []
+
+        try:
+            parsed_lines = self.parse_script_lines(script_text)
+            speaker_configs = self._normalize_speaker_rows(speaker_rows)
+        except ValueError as exc:
+            return None, [], f"❌ {exc}", []
+
+        missing_speakers = [line.speaker for line in parsed_lines if line.speaker not in speaker_configs]
+        if missing_speakers:
+            unique_missing = ", ".join(dict.fromkeys(missing_speakers))
+            return None, [], f"❌ 다음 화자에 대한 설정이 없습니다: {unique_missing}", []
+
+        job_dir = self._create_multi_speaker_job_dir(job_name or "multi_speaker")
+        prompt_cache: Dict[str, Any] = {}
+        rendered_wavs: List[np.ndarray] = []
+        output_files: List[str] = []
+        result_rows: List[List[Any]] = []
+        final_mix_path: Optional[str] = None
+        sample_rate_for_merge: Optional[int] = None
+
+        try:
+            with open(os.path.join(job_dir, "script.txt"), "w", encoding="utf-8") as script_file:
+                script_file.write(script_text.strip() + "\n")
+
+            for line in parsed_lines:
+                speaker_config = speaker_configs[line.speaker]
+                prompt_path = speaker_config["prompt_path"]
+                options: PostprocessOptions = speaker_config["options"]
+
+                if prompt_path not in prompt_cache:
+                    prompt_cache[prompt_path] = self._load_voice_prompt_items(prompt_path)
+
+                wav, sample_rate, chunk_count = self._generate_voice_clone_wav(
+                    text=line.text,
+                    language=language,
+                    audio_input=None,
+                    reference_text=None,
+                    x_vector_only_mode=False,
+                    voice_clone_prompt=prompt_cache[prompt_path],
+                )
+                processed_wav = self._apply_postprocess(wav, sample_rate, options)
+                sample_rate_for_merge = sample_rate
+                rendered_wavs.append(processed_wav)
+
+                line_filename = f"{line.line_id}_{self._sanitize_filename_part(line.speaker, 'speaker')}.wav"
+                line_path = os.path.join(job_dir, line_filename)
+                self._save_wav_to_path(processed_wav, sample_rate, line_path)
+                if save_line_files:
+                    output_files.append(line_path)
+
+                result_rows.append(
+                    [
+                        line.line_id,
+                        line.speaker,
+                        line.text,
+                        "완료",
+                        line_path,
+                        chunk_count,
+                    ]
+                )
+
+            if merge_output and rendered_wavs and sample_rate_for_merge is not None:
+                merged_wav = self._merge_wavs_with_silence(rendered_wavs, sample_rate_for_merge, silence_ms)
+                final_mix_path = os.path.join(job_dir, "final_mix.wav")
+                self._save_wav_to_path(merged_wav, sample_rate_for_merge, final_mix_path)
+                output_files.append(final_mix_path)
+
+            manifest = {
+                "job_name": job_name or os.path.basename(job_dir),
+                "job_dir": job_dir,
+                "language": language,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "save_line_files": bool(save_line_files),
+                "merge_output": bool(merge_output),
+                "silence_ms": int(silence_ms),
+                "script_text": script_text,
+                "speakers": {
+                    speaker: {
+                        "prompt_path": config["prompt_path"],
+                        "options": asdict(config["options"]),
+                    }
+                    for speaker, config in speaker_configs.items()
+                },
+                "lines": [
+                    {
+                        "line_id": row[0],
+                        "speaker": row[1],
+                        "text": row[2],
+                        "status": row[3],
+                        "audio_path": row[4],
+                        "chunk_count": row[5],
+                    }
+                    for row in result_rows
+                ],
+                "final_mix_path": final_mix_path,
+            }
+            manifest_path = os.path.join(job_dir, "script_manifest.json")
+            with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+                json.dump(manifest, manifest_file, ensure_ascii=False, indent=2)
+            output_files.append(manifest_path)
+
+            summary = (
+                f"✅ 다화자 대본 생성 완료\n"
+                f"대사 줄 수: {len(result_rows)}\n"
+                f"화자 수: {len(speaker_configs)}\n"
+                f"작업 폴더: {job_dir}"
+            )
+            return final_mix_path, output_files, summary, result_rows
+        except Exception as exc:
+            return None, output_files, f"❌ 다화자 생성 실패: {type(exc).__name__}: {exc}", result_rows
+
     def _generate_voice_clone_wav(
         self,
         text: str,
@@ -532,11 +793,7 @@ class TTSModel:
 
         try:
             prompt_path = getattr(prompt_file, "name", None) or getattr(prompt_file, "path", None) or str(prompt_file)
-            payload = torch.load(prompt_path, map_location="cpu", weights_only=True)
-            if not isinstance(payload, dict) or "items" not in payload:
-                return None, "❌ 올바른 voice prompt 파일이 아닙니다."
-
-            items = [VoiceClonePromptItem(**item) for item in payload["items"]]
+            items = self._load_voice_prompt_items(prompt_path)
             wav, sample_rate, chunk_count = self._generate_voice_clone_wav(
                 text=text.strip(),
                 language=language,
