@@ -2,6 +2,8 @@
 Qwen3-TTS Gradio app for Korean-first local voice cloning.
 """
 
+import os
+
 import gradio as gr
 
 from storage import configure_runtime_storage
@@ -14,7 +16,7 @@ configure_runtime_storage()
 
 CUSTOM_CSS = """
 .gradio-container {
-    max-width: 980px !important;
+    max-width: 96vw !important;
     margin: auto !important;
 }
 
@@ -37,7 +39,101 @@ CUSTOM_CSS = """
     border-radius: 12px;
     background: linear-gradient(135deg, #f3f7f0 0%, #d8e2dc 100%);
 }
+
+.workspace-card {
+    border: 1px solid #d9e3d6;
+    border-radius: 16px;
+    padding: 16px;
+    background: #fbfdf9;
+}
+
+.workspace-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: #153243;
+    margin-bottom: 0.6rem;
+}
+
+.speaker-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.speaker-card {
+    border: 1px solid #d6ddd2;
+    border-radius: 14px;
+    padding: 12px;
+    background: #ffffff;
+}
+
+.speaker-card.active {
+    border-color: #153243;
+    box-shadow: 0 0 0 1px #153243 inset;
+    background: #f4f8f9;
+}
+
+.speaker-card-top {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.speaker-index {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 999px;
+    background: #153243;
+    color: #fff;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.speaker-name {
+    font-weight: 700;
+    color: #153243;
+}
+
+.speaker-badge {
+    display: inline-block;
+    padding: 4px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+    margin-bottom: 8px;
+}
+
+.speaker-badge.assigned {
+    background: #d8efe0;
+    color: #1d6b41;
+}
+
+.speaker-badge.empty {
+    background: #f7dfdf;
+    color: #9a2c2c;
+}
+
+.speaker-prompt {
+    font-size: 12px;
+    color: #55626b;
+    line-height: 1.4;
+    word-break: break-all;
+}
 """
+
+CARD_LIMIT = 10
+ENDING_STYLE_CHOICES = [
+    ("기본", "default"),
+    ("부드럽게 마침", "soften"),
+    ("빠르게 감쇠", "fade"),
+    ("여운 추가", "hold"),
+    ("자연스럽게 마침", "natural"),
+]
 
 
 def save_postprocess_preset_ui(preset_name, speed, pitch_semitones, ending_style, ending_length_ms):
@@ -88,6 +184,242 @@ def convert_voice_ui(
 def extract_multi_speaker_rows_ui(script_text):
     rows, status = tts_model.build_multi_speaker_rows(script_text)
     return rows, status
+
+
+def clear_multi_line_preview_ui():
+    return None, "", "", "줄을 선택하면 여기서 미리듣기할 수 있습니다."
+
+
+def paragraph_cards_from_script_ui(script_text):
+    cards = tts_model.build_paragraph_card_rows(script_text, max_blocks=CARD_LIMIT)
+    prompt_choices = tts_model.get_voice_prompt_choices()
+    outputs = [
+        f"✅ 문단 카드 {len(cards)}개 준비 완료\n문단은 빈 줄 기준으로 나뉩니다.",
+        gr.update(value=[]),
+    ]
+
+    for index in range(CARD_LIMIT):
+        if index < len(cards):
+            card = cards[index]
+            outputs.extend(
+                [
+                    gr.update(label=f"문단 카드 {index + 1}", open=index < 2),
+                    card["text"],
+                    card["speaker"],
+                    gr.update(choices=prompt_choices, value=None),
+                    "",
+                    float(card["speed"]),
+                    float(card["pitch"]),
+                    str(card["ending_style"]),
+                    int(card["ending_length_ms"]),
+                ]
+            )
+        else:
+            outputs.extend(
+                [
+                    gr.update(label=f"문단 카드 {index + 1}", open=False),
+                    "",
+                    "",
+                    gr.update(choices=prompt_choices, value=None),
+                    "",
+                    1.0,
+                    0.0,
+                    "default",
+                    180,
+                ]
+            )
+    return tuple(outputs)
+
+
+def refresh_card_prompt_choices_ui():
+    prompt_choices = tts_model.get_voice_prompt_choices()
+    outputs = []
+    for _ in range(CARD_LIMIT):
+        outputs.append(gr.update(choices=prompt_choices))
+    outputs.append(f"✅ voice prompt {len(prompt_choices)}개 검색 완료")
+    return tuple(outputs)
+
+
+def set_card_prompt_from_library_ui(selected_prompt_path):
+    return selected_prompt_path or ""
+
+
+def set_card_prompt_from_upload_ui(uploaded_file):
+    return tts_model._resolve_file_path(uploaded_file) or ""
+
+
+def generate_multi_speaker_from_cards_ui(*args):
+    expected_card_fields = CARD_LIMIT * 8
+    card_args = args[:expected_card_fields]
+    language, job_name, save_line_files, merge_output, silence_ms = args[expected_card_fields:]
+
+    paragraph_cards = []
+    for index in range(CARD_LIMIT):
+        offset = index * 8
+        text = str(card_args[offset]).strip() if card_args[offset] is not None else ""
+        speaker = str(card_args[offset + 1]).strip() if card_args[offset + 1] is not None else ""
+        prompt_path = str(card_args[offset + 3]).strip() if card_args[offset + 3] is not None else ""
+        if not text:
+            continue
+        paragraph_cards.append(
+            {
+                "card_index": index + 1,
+                "text": text,
+                "speaker": speaker,
+                "prompt_path": prompt_path,
+                "speed": float(card_args[offset + 4]),
+                "pitch": float(card_args[offset + 5]),
+                "ending_style": str(card_args[offset + 6]),
+                "ending_length_ms": int(card_args[offset + 7]),
+            }
+        )
+
+    return tts_model.generate_multi_speaker_paragraphs(
+        paragraph_cards=paragraph_cards,
+        language=language,
+        job_name=job_name,
+        save_line_files=save_line_files,
+        merge_output=merge_output,
+        silence_ms=silence_ms,
+    )
+
+
+def build_cards_summary_ui(*args):
+    rows = []
+    for index in range(CARD_LIMIT):
+        offset = index * 8
+        text = str(args[offset]).strip() if args[offset] is not None else ""
+        speaker = str(args[offset + 1]).strip() if args[offset + 1] is not None else ""
+        prompt_path = str(args[offset + 3]).strip() if args[offset + 3] is not None else ""
+        if not text:
+            continue
+        rows.append(
+            [
+                speaker,
+                prompt_path,
+                float(args[offset + 4]),
+                float(args[offset + 5]),
+                str(args[offset + 6]),
+                int(args[offset + 7]),
+            ]
+        )
+    return rows
+
+
+def _normalize_multi_rows(rows):
+    if hasattr(rows, "fillna") and hasattr(rows, "values"):
+        rows = rows.fillna("").values.tolist()
+    elif isinstance(rows, tuple):
+        rows = list(rows)
+    return rows if isinstance(rows, list) else []
+
+def build_speaker_cards_html(rows, selected_speaker=""):
+    normalized = _normalize_multi_rows(rows)
+    if not normalized:
+        return "<div class='speaker-cards-empty'>화자 추출 후 카드가 표시됩니다.</div>"
+
+    parts = ["<div class='speaker-cards'>"]
+    for index, row in enumerate(normalized, start=1):
+        speaker = str(row[0]).strip() if len(row) > 0 and row[0] is not None else f"speaker_{index}"
+        prompt_path = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+        assigned = bool(prompt_path)
+        card_class = "speaker-card active" if speaker == selected_speaker else "speaker-card"
+        badge = "연결됨" if assigned else "미지정"
+        badge_class = "assigned" if assigned else "empty"
+        prompt_name = os.path.basename(prompt_path) if prompt_path else "voice prompt 없음"
+        parts.append(
+            f"<div class='{card_class}'>"
+            f"<div class='speaker-card-top'><span class='speaker-index'>{index}</span><span class='speaker-name'>{speaker}</span></div>"
+            f"<div class='speaker-badge {badge_class}'>{badge}</div>"
+            f"<div class='speaker-prompt'>{prompt_name}</div>"
+            f"</div>"
+        )
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def _first_speaker_name(rows):
+    normalized = _normalize_multi_rows(rows)
+    for row in normalized:
+        if row and len(row) > 0 and str(row[0]).strip():
+            return str(row[0]).strip()
+    return None
+
+
+def extract_multi_speaker_workspace_ui(script_text):
+    rows, status = tts_model.build_multi_speaker_rows(script_text)
+    if status.startswith("❌"):
+        return rows, status, build_speaker_cards_html([]), gr.update(choices=[], value=None), gr.update(choices=[], value=None), "", 1.0, 0.0, "default", 180, "화자 추출에 실패했습니다."
+
+    speaker_selector = tts_model.build_speaker_selector(rows)
+    selected_speaker = _first_speaker_name(rows)
+    prompt_path, speed, pitch, ending_style, ending_length, editor_status = tts_model.get_speaker_editor_values(rows, selected_speaker)
+    prompt_choices = tts_model.get_voice_prompt_choices()
+    merged_status = f"{status}\n✅ voice prompt {len(prompt_choices)}개 검색 완료"
+    return (
+        rows,
+        merged_status,
+        build_speaker_cards_html(rows, selected_speaker),
+        gr.update(choices=speaker_selector.choices, value=selected_speaker),
+        gr.update(choices=prompt_choices, value=prompt_path or None),
+        prompt_path,
+        speed,
+        pitch,
+        ending_style,
+        ending_length,
+        editor_status,
+    )
+
+
+def refresh_prompt_library_ui(rows, selected_speaker):
+    prompt_choices = tts_model.get_voice_prompt_choices()
+    prompt_path, speed, pitch, ending_style, ending_length, status = tts_model.get_speaker_editor_values(rows, selected_speaker)
+    return gr.update(choices=prompt_choices, value=prompt_path or None), f"✅ voice prompt {len(prompt_choices)}개 검색 완료"
+
+
+def select_speaker_card_ui(rows, selected_speaker):
+    prompt_choices = tts_model.get_voice_prompt_choices()
+    prompt_path, speed, pitch, ending_style, ending_length, status = tts_model.get_speaker_editor_values(rows, selected_speaker)
+    return (
+        build_speaker_cards_html(rows, selected_speaker),
+        gr.update(choices=prompt_choices, value=prompt_path or None),
+        prompt_path,
+        speed,
+        pitch,
+        ending_style,
+        ending_length,
+        status,
+    )
+
+
+def apply_selected_speaker_ui(rows, selected_speaker, selected_prompt_path, uploaded_prompt_file, speed, pitch, ending_style, ending_length_ms):
+    updated_rows, prompt_path, status, next_speaker = tts_model.update_speaker_row(
+        rows,
+        selected_speaker,
+        selected_prompt_path,
+        "",
+        uploaded_prompt_file,
+        speed,
+        pitch,
+        ending_style,
+        ending_length_ms,
+    )
+    speaker_selector = tts_model.build_speaker_selector(updated_rows)
+    target_speaker = next_speaker or selected_speaker or _first_speaker_name(updated_rows)
+    prompt_choices = tts_model.get_voice_prompt_choices()
+    current_prompt_path, current_speed, current_pitch, current_ending_style, current_ending_length, _ = tts_model.get_speaker_editor_values(updated_rows, target_speaker)
+    return (
+        updated_rows,
+        build_speaker_cards_html(updated_rows, target_speaker),
+        gr.update(choices=speaker_selector.choices, value=target_speaker),
+        gr.update(choices=prompt_choices, value=current_prompt_path or None),
+        current_prompt_path,
+        current_speed,
+        current_pitch,
+        current_ending_style,
+        current_ending_length,
+        status,
+    )
 
 
 def create_app():
@@ -291,71 +623,157 @@ def create_app():
                     prompt_processed_audio = gr.Audio(label="후처리 적용 음성", type="filepath")
 
             with gr.Tab("다화자 대본 생성"):
+                multi_job_dir_state = gr.State("")
                 gr.Markdown(
-                    "긴 대본을 `화자: 대사` 형식으로 입력한 뒤, 화자를 추출해서 각 화자에 맞는 "
-                    "`voice prompt(.pt)` 경로를 지정하면 줄별 음성과 최종 합본을 로컬에 저장합니다."
-                )
-                multi_script_input = gr.Textbox(
-                    label="대본 입력",
-                    lines=12,
-                    placeholder=(
-                        "예:\n"
-                        "나레이터: 오늘은 새로운 기능을 소개합니다.\n"
-                        "여자1: 첫 번째 장면을 시작하겠습니다.\n"
-                        "남자1: 다음 내용을 이어서 설명하겠습니다."
-                    ),
+                    "문단은 사용자가 직접 입력하고, 각 문단 카드마다 화자와 voice prompt를 직접 지정합니다. "
+                    "빈 줄을 기준으로 문단 카드를 만들고, 최대 10개 카드까지 편집할 수 있습니다."
                 )
                 with gr.Row():
-                    multi_extract_btn = gr.Button("화자 추출", variant="secondary")
-                    multi_generate_btn = gr.Button("다화자 음성 생성", variant="primary")
-                multi_status = gr.Textbox(
-                    label="상태 / 안내",
-                    interactive=False,
-                    lines=5,
-                    value="대본을 입력하고 `화자 추출`을 누르세요.",
-                )
-                with gr.Row():
-                    multi_job_name = gr.Textbox(
-                        label="작업 이름",
-                        value="multi_speaker_demo",
-                        placeholder="예: story_episode_01",
-                    )
-                    multi_silence_ms = gr.Slider(
-                        minimum=0,
-                        maximum=1500,
-                        value=120,
-                        step=20,
-                        label="줄 사이 무음(ms)",
-                    )
-                with gr.Row():
-                    multi_save_lines = gr.Checkbox(label="줄별 파일 목록에 포함", value=True)
-                    multi_make_mix = gr.Checkbox(label="최종 합본 생성", value=True)
+                    with gr.Column(scale=7):
+                        gr.HTML('<div class="workspace-card"><div class="workspace-title">대본 작업 공간</div></div>')
+                        multi_script_input = gr.Textbox(
+                            label="대본 입력",
+                            lines=18,
+                            placeholder=(
+                                "예:\n"
+                                "원래 안 사려고 했던 물건도\n"
+                                "마지막 1개 남음이라는 문구를 보는 순간\n"
+                                "갑자기 마음이 급해질 때가 있습니다.\n\n"
+                                "조금 전까지만 해도 괜찮았는데,\n"
+                                "그 한 줄이 뜨는 순간\n"
+                                "지금 안 사면 놓칠 것 같다는 감정이 밀려오죠."
+                            ),
+                        )
+                        with gr.Row():
+                            multi_extract_btn = gr.Button("문단 카드 만들기", variant="secondary")
+                            multi_generate_btn = gr.Button("다화자 음성 생성", variant="primary")
+                        multi_status = gr.Textbox(
+                            label="상태 / 안내",
+                            interactive=False,
+                            lines=5,
+                            value="대본을 입력한 뒤 `문단 카드 만들기`를 누르세요.",
+                        )
+                        with gr.Row():
+                            multi_job_name = gr.Textbox(
+                                label="작업 이름",
+                                value="multi_speaker_demo",
+                                placeholder="예: story_episode_01",
+                            )
+                            multi_silence_ms = gr.Slider(
+                                minimum=0,
+                                maximum=1500,
+                                value=120,
+                                step=20,
+                                label="줄 사이 무음(ms)",
+                            )
+                        with gr.Row():
+                            multi_save_lines = gr.Checkbox(label="줄별 파일 목록에 포함", value=True)
+                            multi_make_mix = gr.Checkbox(label="최종 합본 생성", value=True)
 
-                multi_speaker_table = gr.Dataframe(
-                    headers=["speaker", "prompt_path", "speed", "pitch", "ending_style", "ending_length_ms"],
-                    datatype=["str", "str", "number", "number", "str", "number"],
-                    row_count=(1, "dynamic"),
-                    column_count=(6, "fixed"),
-                    interactive=True,
-                    wrap=True,
-                    label="화자별 설정 표",
-                    value=[["나레이터", "", 1.0, 0.0, "default", 180]],
-                )
-                gr.Markdown(
-                    "`prompt_path`에는 로컬의 `voice prompt(.pt)` 경로를 직접 넣어주세요. "
-                    "`ending_style`은 `default`, `soften`, `fade`, `hold`, `natural` 중 하나를 사용합니다."
-                )
-                multi_result_table = gr.Dataframe(
-                    headers=["line_id", "speaker", "text", "status", "audio_path", "chunks"],
-                    datatype=["str", "str", "str", "str", "str", "number"],
-                    row_count=(0, "dynamic"),
-                    column_count=(6, "fixed"),
-                    interactive=False,
-                    wrap=True,
-                    label="줄별 생성 결과",
-                )
-                multi_final_audio = gr.Audio(label="최종 합본", type="filepath")
-                multi_output_files = gr.Files(label="생성된 파일")
+                        multi_result_table = gr.Dataframe(
+                            headers=["line_id", "speaker", "text", "status", "audio_path", "chunks", "selected_version", "version_count"],
+                            datatype=["str", "str", "str", "str", "str", "number", "str", "number"],
+                            row_count=(0, "dynamic"),
+                            column_count=(8, "fixed"),
+                            interactive=False,
+                            wrap=True,
+                            label="줄별 생성 결과",
+                        )
+                        multi_final_audio = gr.Audio(label="최종 합본", type="filepath")
+                        multi_output_files = gr.Files(label="생성된 파일")
+
+                    with gr.Column(scale=4):
+                        gr.HTML('<div class="workspace-card"><div class="workspace-title">문단 카드 편집기</div></div>')
+                        multi_refresh_prompts_btn = gr.Button("저장된 voice prompt 목록 새로고침")
+                        multi_editor_status = gr.Textbox(
+                            label="문단 카드 상태",
+                            interactive=False,
+                            lines=4,
+                            value="문단 카드를 만든 뒤 각 카드에 화자와 voice prompt를 지정하세요.",
+                        )
+                        multi_card_components = []
+                        for index in range(CARD_LIMIT):
+                            with gr.Accordion(f"문단 카드 {index + 1}", open=index < 2) as card_box:
+                                card_text = gr.Textbox(label="문단 텍스트", lines=5)
+                                card_speaker = gr.Textbox(label="화자 이름", placeholder=f"예: 화자{index + 1}")
+                                card_prompt_library = gr.Dropdown(
+                                    choices=tts_model.get_voice_prompt_choices(),
+                                    value=None,
+                                    label="저장된 voice prompt",
+                                    allow_custom_value=True,
+                                )
+                                card_prompt_upload = gr.File(
+                                    label="이 카드에 .pt 드래그 앤 드롭",
+                                    file_types=[".pt"],
+                                    type="filepath",
+                                )
+                                card_prompt_path = gr.Textbox(
+                                    label="현재 연결된 voice prompt 경로",
+                                    lines=2,
+                                )
+                                with gr.Row():
+                                    card_speed = gr.Slider(minimum=0.7, maximum=1.4, value=1.0, step=0.05, label="속도")
+                                    card_pitch = gr.Slider(minimum=-4.0, maximum=4.0, value=0.0, step=0.5, label="피치")
+                                with gr.Row():
+                                    card_ending_style = gr.Dropdown(choices=ENDING_STYLE_CHOICES, value="default", label="끝음 처리")
+                                    card_ending_length = gr.Slider(minimum=80, maximum=1200, value=180, step=20, label="끝음 길이(ms)")
+
+                                card_prompt_library.change(
+                                    fn=set_card_prompt_from_library_ui,
+                                    inputs=[card_prompt_library],
+                                    outputs=[card_prompt_path],
+                                )
+                                card_prompt_upload.change(
+                                    fn=set_card_prompt_from_upload_ui,
+                                    inputs=[card_prompt_upload],
+                                    outputs=[card_prompt_path],
+                                )
+
+                                multi_card_components.append(
+                                    {
+                                        "accordion": card_box,
+                                        "text": card_text,
+                                        "speaker": card_speaker,
+                                        "prompt_library": card_prompt_library,
+                                        "prompt_path": card_prompt_path,
+                                        "speed": card_speed,
+                                        "pitch": card_pitch,
+                                        "ending_style": card_ending_style,
+                                        "ending_length": card_ending_length,
+                                    }
+                                )
+
+                        multi_speaker_table = gr.Dataframe(
+                            headers=["speaker", "prompt_path", "speed", "pitch", "ending_style", "ending_length_ms"],
+                            datatype=["str", "str", "number", "number", "str", "number"],
+                            row_count=(0, "dynamic"),
+                            column_count=(6, "fixed"),
+                            interactive=False,
+                            wrap=True,
+                            label="현재 카드 설정 요약",
+                            value=[],
+                        )
+
+                with gr.Accordion("줄별 미리듣기 / 다시 생성", open=True):
+                    with gr.Row():
+                        multi_line_selector = gr.Dropdown(
+                            choices=[],
+                            value=None,
+                            label="선택 줄",
+                            info="생성 후 확인하거나 다시 만들 줄을 선택합니다.",
+                        )
+                        multi_preview_btn = gr.Button("선택 줄 미리듣기", variant="secondary")
+                        multi_regenerate_btn = gr.Button("선택 줄 다시 생성", variant="primary")
+                    multi_line_status = gr.Textbox(
+                        label="줄 작업 상태",
+                        interactive=False,
+                        lines=4,
+                        value="줄을 선택하면 여기서 미리듣기할 수 있습니다.",
+                    )
+                    multi_line_audio = gr.Audio(label="선택 줄 오디오", type="filepath")
+                    with gr.Row():
+                        multi_line_speaker = gr.Textbox(label="선택 줄 화자", interactive=False)
+                        multi_line_text = gr.Textbox(label="선택 줄 대사", interactive=False, lines=3)
 
             with gr.Tab("음성 대 음성 변조 (RVC 실험)"):
                 gr.Markdown(
@@ -527,24 +945,97 @@ def create_app():
             outputs=[prompt_processed_audio, prompt_postprocess_status],
         )
 
+        card_extract_outputs = [multi_status, multi_speaker_table]
+        for card in multi_card_components:
+            card_extract_outputs.extend(
+                [
+                    card["accordion"],
+                    card["text"],
+                    card["speaker"],
+                    card["prompt_library"],
+                    card["prompt_path"],
+                    card["speed"],
+                    card["pitch"],
+                    card["ending_style"],
+                    card["ending_length"],
+                ]
+            )
+
         multi_extract_btn.click(
-            fn=extract_multi_speaker_rows_ui,
+            fn=paragraph_cards_from_script_ui,
             inputs=[multi_script_input],
-            outputs=[multi_speaker_table, multi_status],
+            outputs=card_extract_outputs,
+        )
+
+        multi_extract_btn.click(
+            fn=clear_multi_line_preview_ui,
+            outputs=[multi_line_audio, multi_line_speaker, multi_line_text, multi_line_status],
+        )
+
+        multi_refresh_prompts_btn.click(
+            fn=refresh_card_prompt_choices_ui,
+            outputs=[*[card["prompt_library"] for card in multi_card_components], multi_editor_status],
+        )
+
+        summary_inputs = []
+        for card in multi_card_components:
+            summary_inputs.extend(
+                [
+                    card["text"],
+                    card["speaker"],
+                    card["prompt_library"],
+                    card["prompt_path"],
+                    card["speed"],
+                    card["pitch"],
+                    card["ending_style"],
+                    card["ending_length"],
+                ]
+            )
+
+        for card in multi_card_components:
+            card["text"].change(fn=build_cards_summary_ui, inputs=summary_inputs, outputs=[multi_speaker_table])
+            card["speaker"].change(fn=build_cards_summary_ui, inputs=summary_inputs, outputs=[multi_speaker_table])
+            card["prompt_path"].change(fn=build_cards_summary_ui, inputs=summary_inputs, outputs=[multi_speaker_table])
+            card["speed"].release(fn=build_cards_summary_ui, inputs=summary_inputs, outputs=[multi_speaker_table])
+            card["pitch"].release(fn=build_cards_summary_ui, inputs=summary_inputs, outputs=[multi_speaker_table])
+            card["ending_style"].change(fn=build_cards_summary_ui, inputs=summary_inputs, outputs=[multi_speaker_table])
+            card["ending_length"].release(fn=build_cards_summary_ui, inputs=summary_inputs, outputs=[multi_speaker_table])
+
+        multi_generate_btn.click(
+            fn=generate_multi_speaker_from_cards_ui,
+            inputs=[*summary_inputs, language_dropdown, multi_job_name, multi_save_lines, multi_make_mix, multi_silence_ms],
+            outputs=[multi_final_audio, multi_output_files, multi_status, multi_result_table, multi_job_dir_state, multi_line_selector],
         )
 
         multi_generate_btn.click(
-            fn=tts_model.generate_multi_speaker_script,
+            fn=clear_multi_line_preview_ui,
+            outputs=[multi_line_audio, multi_line_speaker, multi_line_text, multi_line_status],
+        )
+
+        multi_preview_btn.click(
+            fn=tts_model.preview_multi_speaker_line,
+            inputs=[multi_job_dir_state, multi_line_selector],
+            outputs=[multi_line_audio, multi_line_speaker, multi_line_text, multi_line_status],
+        )
+
+        multi_regenerate_btn.click(
+            fn=tts_model.regenerate_multi_speaker_line,
             inputs=[
-                multi_script_input,
+                multi_job_dir_state,
+                multi_line_selector,
                 multi_speaker_table,
                 language_dropdown,
-                multi_job_name,
-                multi_save_lines,
                 multi_make_mix,
                 multi_silence_ms,
             ],
-            outputs=[multi_final_audio, multi_output_files, multi_status, multi_result_table],
+            outputs=[
+                multi_line_audio,
+                multi_final_audio,
+                multi_output_files,
+                multi_line_status,
+                multi_result_table,
+                multi_line_selector,
+            ],
         )
 
         vc_refresh_btn.click(

@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import soundfile as sf
 import torch
+import gradio as gr
 from storage import configure_runtime_storage
 
 try:
@@ -171,6 +172,18 @@ class TTSModel:
     def _sanitize_project_name(self, name: str) -> str:
         return self._sanitize_filename_part(name, "multi_speaker_job")
 
+    def _first_word_token(self, text: str) -> str:
+        words = re.findall(r"\S+", (text or "").strip())
+        first = words[0] if words else "line"
+        return self._sanitize_filename_part(first, "line")
+
+    def _build_multi_speaker_filename(self, line_index: int, speaker: str, text: str, version_id: str) -> str:
+        line_part = f"{int(line_index):03d}"
+        speaker_part = self._sanitize_filename_part(speaker, "speaker")
+        first_word = self._first_word_token(text)
+        version_part = self._sanitize_filename_part(version_id, "v1")
+        return f"{line_part}_{speaker_part}_{first_word}_{version_part}.wav"
+
     def _default_postprocess_presets(self) -> dict:
         return {
             "기본": asdict(PostprocessOptions()),
@@ -250,6 +263,46 @@ class TTSModel:
         if not file_input:
             return None
         return getattr(file_input, "name", None) or getattr(file_input, "path", None) or str(file_input)
+
+    def _resolve_file_paths(self, file_inputs) -> List[str]:
+        if not file_inputs:
+            return []
+        if isinstance(file_inputs, (list, tuple)):
+            resolved = [self._resolve_file_path(item) for item in file_inputs]
+            return [path for path in resolved if path]
+        single = self._resolve_file_path(file_inputs)
+        return [single] if single else []
+
+    def _is_voice_prompt_candidate(self, path: str) -> bool:
+        lower_name = os.path.basename(path).lower()
+        if not lower_name.endswith(".pt"):
+            return False
+        blocked = {"hubert_base.pt", "rmvpe.pt"}
+        if lower_name in blocked:
+            return False
+        return True
+
+    def get_voice_prompt_choices(self) -> List[Tuple[str, str]]:
+        prompt_paths: List[str] = []
+        for root, _, files in os.walk(self.output_dir):
+            for filename in files:
+                path = os.path.join(root, filename)
+                if self._is_voice_prompt_candidate(path):
+                    prompt_paths.append(path)
+
+        prompt_paths = sorted(set(prompt_paths), key=lambda item: item.lower())
+        choices: List[Tuple[str, str]] = []
+        for path in prompt_paths:
+            label = os.path.basename(path)
+            relative_dir = os.path.relpath(os.path.dirname(path), self.output_dir)
+            if relative_dir != ".":
+                label = f"{label}  ({relative_dir})"
+            choices.append((label, path))
+        return choices
+
+    def refresh_voice_prompt_dropdown(self) -> Tuple[gr.Dropdown, str]:
+        choices = self.get_voice_prompt_choices()
+        return gr.Dropdown(choices=choices, value=choices[0][1] if choices else None), f"✅ voice prompt {len(choices)}개 검색 완료"
 
     def _load_voice_prompt_items(self, prompt_path: str):
         payload = torch.load(prompt_path, map_location="cpu", weights_only=True)
@@ -475,6 +528,15 @@ class TTSModel:
 
         return parsed_lines
 
+    def parse_paragraph_blocks(self, script_text: str, max_blocks: int = 10) -> List[str]:
+        if not script_text or not script_text.strip():
+            return []
+
+        normalized = script_text.replace("\r\n", "\n").replace("\r", "\n")
+        blocks = re.split(r"\n\s*\n+", normalized)
+        cleaned = [block.strip() for block in blocks if block and block.strip()]
+        return cleaned[:max_blocks]
+
     def build_multi_speaker_rows(self, script_text: str) -> Tuple[List[List[Any]], str]:
         try:
             parsed_lines = self.parse_script_lines(script_text)
@@ -490,6 +552,190 @@ class TTSModel:
             rows.append([line.speaker, "", 1.0, 0.0, "default", 180])
 
         return rows, f"✅ 화자 {len(rows)}명 추출 완료 / 대사 {len(parsed_lines)}줄"
+
+    def build_speaker_selector(self, speaker_rows) -> gr.Dropdown:
+        if hasattr(speaker_rows, "fillna") and hasattr(speaker_rows, "values"):
+            speaker_rows = speaker_rows.fillna("").values.tolist()
+        elif isinstance(speaker_rows, tuple):
+            speaker_rows = list(speaker_rows)
+
+        speakers: List[str] = []
+        if isinstance(speaker_rows, list):
+            for row in speaker_rows:
+                if row and len(row) > 0 and str(row[0]).strip():
+                    speakers.append(str(row[0]).strip())
+        unique_speakers = list(dict.fromkeys(speakers))
+        return gr.Dropdown(choices=unique_speakers, value=unique_speakers[0] if unique_speakers else None)
+
+    def _next_unassigned_speaker(self, speaker_rows, current_speaker: str = "") -> Optional[str]:
+        if hasattr(speaker_rows, "fillna") and hasattr(speaker_rows, "values"):
+            speaker_rows = speaker_rows.fillna("").values.tolist()
+        elif isinstance(speaker_rows, tuple):
+            speaker_rows = list(speaker_rows)
+
+        if not isinstance(speaker_rows, list):
+            return None
+
+        ordered = []
+        for row in speaker_rows:
+            if row and len(row) > 0 and str(row[0]).strip():
+                speaker = str(row[0]).strip()
+                prompt_path = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+                ordered.append((speaker, prompt_path))
+
+        if not ordered:
+            return None
+
+        for speaker, prompt_path in ordered:
+            if not prompt_path:
+                return speaker
+
+        if current_speaker:
+            speakers = [speaker for speaker, _ in ordered]
+            if current_speaker in speakers:
+                current_index = speakers.index(current_speaker)
+                if current_index + 1 < len(speakers):
+                    return speakers[current_index + 1]
+        return ordered[0][0]
+
+    def summarize_speaker_rows(self, speaker_rows) -> str:
+        if hasattr(speaker_rows, "fillna") and hasattr(speaker_rows, "values"):
+            speaker_rows = speaker_rows.fillna("").values.tolist()
+        elif isinstance(speaker_rows, tuple):
+            speaker_rows = list(speaker_rows)
+
+        if not isinstance(speaker_rows, list):
+            return "화자 설정 표를 준비해주세요."
+
+        total = 0
+        assigned = 0
+        for row in speaker_rows:
+            if row and len(row) > 0 and str(row[0]).strip():
+                total += 1
+                prompt_path = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+                if prompt_path:
+                    assigned += 1
+        return f"화자 {assigned}/{total}명에 voice prompt가 연결됨"
+
+    def get_speaker_editor_values(
+        self,
+        speaker_rows,
+        selected_speaker: str,
+    ) -> Tuple[str, float, float, str, int, str]:
+        if hasattr(speaker_rows, "fillna") and hasattr(speaker_rows, "values"):
+            speaker_rows = speaker_rows.fillna("").values.tolist()
+        elif isinstance(speaker_rows, tuple):
+            speaker_rows = list(speaker_rows)
+
+        if not selected_speaker:
+            return "", 1.0, 0.0, "default", 180, "화자를 먼저 선택해주세요."
+
+        if not isinstance(speaker_rows, list):
+            return "", 1.0, 0.0, "default", 180, "화자 설정 표를 먼저 준비해주세요."
+
+        for row in speaker_rows:
+            if row and len(row) > 0 and str(row[0]).strip() == selected_speaker:
+                prompt_path = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+                speed = float(row[2]) if len(row) > 2 and row[2] not in (None, "") else 1.0
+                pitch = float(row[3]) if len(row) > 3 and row[3] not in (None, "") else 0.0
+                ending_style = str(row[4]).strip() if len(row) > 4 and row[4] not in (None, "") else "default"
+                ending_length = int(float(row[5])) if len(row) > 5 and row[5] not in (None, "") else 180
+                return prompt_path, speed, pitch, ending_style, ending_length, f"✅ '{selected_speaker}' 설정을 불러왔습니다."
+
+        return "", 1.0, 0.0, "default", 180, f"❌ 화자 '{selected_speaker}'를 표에서 찾을 수 없습니다."
+
+    def update_speaker_row(
+        self,
+        speaker_rows,
+        selected_speaker: str,
+        selected_prompt_path: str,
+        browser_prompt_path: str,
+        uploaded_prompt_file,
+        speed: float,
+        pitch: float,
+        ending_style: str,
+        ending_length_ms: int,
+    ) -> Tuple[List[List[Any]], str, str, str]:
+        if hasattr(speaker_rows, "fillna") and hasattr(speaker_rows, "values"):
+            speaker_rows = speaker_rows.fillna("").values.tolist()
+        elif isinstance(speaker_rows, tuple):
+            speaker_rows = list(speaker_rows)
+
+        if not isinstance(speaker_rows, list) or not speaker_rows:
+            return [], "", "❌ 화자 설정 표가 없습니다.", ""
+        if not selected_speaker:
+            return speaker_rows, "", "❌ 수정할 화자를 먼저 선택해주세요.", ""
+
+        uploaded_path = self._resolve_file_path(uploaded_prompt_file)
+        final_prompt_path = uploaded_path or (browser_prompt_path or "").strip() or (selected_prompt_path or "").strip()
+        if not final_prompt_path:
+            return speaker_rows, "", "❌ voice prompt를 드롭하거나 목록에서 선택해주세요.", ""
+        if not os.path.exists(final_prompt_path):
+            return speaker_rows, final_prompt_path, f"❌ 파일이 없습니다: {final_prompt_path}", ""
+
+        updated_rows: List[List[Any]] = []
+        updated = False
+        for row in speaker_rows:
+            if row and len(row) > 0 and str(row[0]).strip() == selected_speaker:
+                updated_rows.append(
+                    [
+                        selected_speaker,
+                        final_prompt_path,
+                        float(speed),
+                        float(pitch),
+                        str(ending_style),
+                        int(ending_length_ms),
+                    ]
+                )
+                updated = True
+            else:
+                updated_rows.append(row)
+
+        if not updated:
+            return speaker_rows, final_prompt_path, f"❌ 화자 '{selected_speaker}'를 찾지 못했습니다.", ""
+
+        next_speaker = self._next_unassigned_speaker(updated_rows, selected_speaker) or selected_speaker
+        summary = self.summarize_speaker_rows(updated_rows)
+        return updated_rows, final_prompt_path, f"✅ '{selected_speaker}' 설정 적용 완료\n{summary}", next_speaker
+
+    def bulk_assign_speaker_rows(
+        self,
+        speaker_rows,
+        uploaded_prompt_files,
+    ) -> Tuple[List[List[Any]], str, str]:
+        if hasattr(speaker_rows, "fillna") and hasattr(speaker_rows, "values"):
+            speaker_rows = speaker_rows.fillna("").values.tolist()
+        elif isinstance(speaker_rows, tuple):
+            speaker_rows = list(speaker_rows)
+
+        if not isinstance(speaker_rows, list) or not speaker_rows:
+            return [], "❌ 화자 설정 표가 없습니다.", ""
+
+        file_paths = [path for path in self._resolve_file_paths(uploaded_prompt_files) if path and os.path.exists(path)]
+        if not file_paths:
+            return speaker_rows, "❌ 일괄 배정할 `.pt` 파일을 하나 이상 드롭해주세요.", ""
+
+        unassigned_indexes = []
+        for index, row in enumerate(speaker_rows):
+            if row and len(row) > 0 and str(row[0]).strip():
+                prompt_path = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+                if not prompt_path:
+                    unassigned_indexes.append(index)
+
+        target_indexes = unassigned_indexes if unassigned_indexes else [index for index, row in enumerate(speaker_rows) if row and len(row) > 0 and str(row[0]).strip()]
+        if not target_indexes:
+            return speaker_rows, "❌ 배정할 화자가 없습니다.", ""
+
+        assigned_count = 0
+        for target_index, prompt_path in zip(target_indexes, file_paths):
+            row = list(speaker_rows[target_index])
+            row[1] = prompt_path
+            speaker_rows[target_index] = row
+            assigned_count += 1
+
+        next_speaker = self._next_unassigned_speaker(speaker_rows, "")
+        summary = self.summarize_speaker_rows(speaker_rows)
+        return speaker_rows, f"✅ {assigned_count}개 voice prompt 일괄 배정 완료\n{summary}", next_speaker or ""
 
     def _normalize_speaker_rows(self, speaker_rows) -> Dict[str, Dict[str, Any]]:
         if speaker_rows is None:
@@ -536,6 +782,197 @@ class TTSModel:
 
         return configs
 
+    def build_paragraph_card_rows(self, script_text: str, max_blocks: int = 10) -> List[Dict[str, Any]]:
+        blocks = self.parse_paragraph_blocks(script_text, max_blocks=max_blocks)
+        rows: List[Dict[str, Any]] = []
+        for index, block in enumerate(blocks, start=1):
+            rows.append(
+                {
+                    "card_index": index,
+                    "text": block,
+                    "speaker": f"화자{index}",
+                    "prompt_path": "",
+                    "speed": 1.0,
+                    "pitch": 0.0,
+                    "ending_style": "default",
+                    "ending_length_ms": 180,
+                }
+            )
+        return rows
+
+    def generate_multi_speaker_paragraphs(
+        self,
+        paragraph_cards: List[Dict[str, Any]],
+        language: str,
+        job_name: str = "",
+        save_line_files: bool = True,
+        merge_output: bool = True,
+        silence_ms: int = 120,
+    ) -> Tuple[Optional[str], List[str], str, List[List[Any]], str, gr.Dropdown]:
+        if self.model is None:
+            return None, [], "❌ 먼저 TTS 모델을 로드해주세요!", [], "", gr.Dropdown(choices=[], value=None)
+        if not paragraph_cards:
+            return None, [], "❌ 생성할 문단 카드가 없습니다.", [], "", gr.Dropdown(choices=[], value=None)
+
+        parsed_lines: List[MultiSpeakerLine] = []
+        speaker_rows: List[List[Any]] = []
+        seen_speakers: Dict[str, List[Any]] = {}
+
+        for index, card in enumerate(paragraph_cards, start=1):
+            text = str(card.get("text", "")).strip()
+            speaker = str(card.get("speaker", "")).strip()
+            prompt_path = str(card.get("prompt_path", "")).strip()
+            if not text:
+                continue
+            if not speaker:
+                return None, [], f"❌ {index}번 문단 카드의 화자 이름이 비어 있습니다.", [], "", gr.Dropdown(choices=[], value=None)
+            if not prompt_path:
+                return None, [], f"❌ {index}번 문단 카드의 voice prompt가 비어 있습니다.", [], "", gr.Dropdown(choices=[], value=None)
+
+            parsed_lines.append(
+                MultiSpeakerLine(
+                    line_id=f"line_{len(parsed_lines)+1:03d}",
+                    line_index=len(parsed_lines) + 1,
+                    speaker=speaker,
+                    text=text,
+                )
+            )
+
+            if speaker not in seen_speakers:
+                seen_speakers[speaker] = [
+                    speaker,
+                    prompt_path,
+                    float(card.get("speed", 1.0)),
+                    float(card.get("pitch", 0.0)),
+                    str(card.get("ending_style", "default")),
+                    int(card.get("ending_length_ms", 180)),
+                ]
+
+        if not parsed_lines:
+            return None, [], "❌ 비어 있지 않은 문단 카드가 없습니다.", [], "", gr.Dropdown(choices=[], value=None)
+
+        speaker_rows = list(seen_speakers.values())
+        try:
+            speaker_configs = self._normalize_speaker_rows(speaker_rows)
+        except ValueError as exc:
+            return None, [], f"❌ {exc}", [], "", gr.Dropdown(choices=[], value=None)
+
+        job_dir = self._create_multi_speaker_job_dir(job_name or "multi_speaker")
+        prompt_cache: Dict[str, Any] = {}
+        rendered_wavs: List[np.ndarray] = []
+        output_files: List[str] = []
+        result_rows: List[List[Any]] = []
+        final_mix_path: Optional[str] = None
+        sample_rate_for_merge: Optional[int] = None
+
+        try:
+            with open(os.path.join(job_dir, "script.txt"), "w", encoding="utf-8") as script_file:
+                script_file.write("\n\n".join(line.text for line in parsed_lines) + "\n")
+
+            for line in parsed_lines:
+                speaker_config = speaker_configs[line.speaker]
+                prompt_path = speaker_config["prompt_path"]
+                options: PostprocessOptions = speaker_config["options"]
+
+                if prompt_path not in prompt_cache:
+                    prompt_cache[prompt_path] = self._load_voice_prompt_items(prompt_path)
+
+                wav, sample_rate, chunk_count = self._generate_voice_clone_wav(
+                    text=line.text,
+                    language=language,
+                    audio_input=None,
+                    reference_text=None,
+                    x_vector_only_mode=False,
+                    voice_clone_prompt=prompt_cache[prompt_path],
+                )
+                processed_wav = self._apply_postprocess(wav, sample_rate, options)
+                sample_rate_for_merge = sample_rate
+                rendered_wavs.append(processed_wav)
+
+                line_filename = self._build_multi_speaker_filename(
+                    line_index=line.line_index,
+                    speaker=line.speaker,
+                    text=line.text,
+                    version_id="v1",
+                )
+                line_path = os.path.join(job_dir, line_filename)
+                self._save_wav_to_path(processed_wav, sample_rate, line_path)
+                if save_line_files:
+                    output_files.append(line_path)
+
+                result_rows.append(
+                    [
+                        line.line_id,
+                        line.speaker,
+                        line.text,
+                        "완료",
+                        line_path,
+                        chunk_count,
+                        "v1",
+                        1,
+                    ]
+                )
+
+            if merge_output and rendered_wavs and sample_rate_for_merge is not None:
+                merged_wav = self._merge_wavs_with_silence(rendered_wavs, sample_rate_for_merge, silence_ms)
+                final_mix_path = os.path.join(job_dir, "final_mix.wav")
+                self._save_wav_to_path(merged_wav, sample_rate_for_merge, final_mix_path)
+                output_files.append(final_mix_path)
+
+            manifest = {
+                "job_name": job_name or os.path.basename(job_dir),
+                "job_dir": job_dir,
+                "language": language,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "save_line_files": bool(save_line_files),
+                "merge_output": bool(merge_output),
+                "silence_ms": int(silence_ms),
+                "paragraph_mode": True,
+                "paragraph_cards": paragraph_cards,
+                "speakers": {
+                    speaker: {
+                        "prompt_path": config["prompt_path"],
+                        "options": asdict(config["options"]),
+                    }
+                    for speaker, config in speaker_configs.items()
+                },
+                "lines": [
+                    {
+                        "line_id": row[0],
+                        "speaker": row[1],
+                        "text": row[2],
+                        "status": row[3],
+                        "audio_path": row[4],
+                        "chunk_count": row[5],
+                        "selected_version": row[6],
+                        "versions": [
+                            {
+                                "version_id": row[6],
+                                "audio_path": row[4],
+                                "chunk_count": row[5],
+                                "created_at": datetime.now().isoformat(timespec="seconds"),
+                            }
+                        ],
+                    }
+                    for row in result_rows
+                ],
+                "final_mix_path": final_mix_path,
+            }
+            manifest_path = self._write_manifest(job_dir, manifest)
+            output_files.append(manifest_path)
+            line_choices = self._build_line_choices_from_manifest(manifest)
+            line_dropdown = gr.Dropdown(choices=line_choices, value=line_choices[0] if line_choices else None)
+
+            summary = (
+                f"✅ 문단 카드 음성 생성 완료\n"
+                f"문단 수: {len(result_rows)}\n"
+                f"화자 수: {len(speaker_configs)}\n"
+                f"작업 폴더: {job_dir}"
+            )
+            return final_mix_path, output_files, summary, result_rows, job_dir, line_dropdown
+        except Exception as exc:
+            return None, output_files, f"❌ 문단 카드 생성 실패: {type(exc).__name__}: {exc}", result_rows, job_dir, gr.Dropdown(choices=[], value=None)
+
     def _create_multi_speaker_job_dir(self, job_name: str) -> str:
         safe_name = self._sanitize_project_name(job_name or "multi_speaker_job")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -546,6 +983,83 @@ class TTSModel:
     def _save_wav_to_path(self, wav: np.ndarray, sample_rate: int, path: str) -> str:
         sf.write(path, wav, sample_rate)
         return path
+
+    def _manifest_path(self, job_dir: str) -> str:
+        return os.path.join(job_dir, "script_manifest.json")
+
+    def _write_manifest(self, job_dir: str, manifest: Dict[str, Any]) -> str:
+        manifest_path = self._manifest_path(job_dir)
+        with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+            json.dump(manifest, manifest_file, ensure_ascii=False, indent=2)
+        return manifest_path
+
+    def _read_manifest(self, job_dir: str) -> Dict[str, Any]:
+        manifest_path = self._manifest_path(job_dir)
+        if not os.path.exists(manifest_path):
+            raise ValueError(f"manifest 파일이 없습니다: {manifest_path}")
+        with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+            payload = json.load(manifest_file)
+        if not isinstance(payload, dict):
+            raise ValueError("manifest 형식이 올바르지 않습니다.")
+        return payload
+
+    def _build_result_rows_from_manifest(self, manifest: Dict[str, Any]) -> List[List[Any]]:
+        rows: List[List[Any]] = []
+        for line in manifest.get("lines", []):
+            selected_version = line.get("selected_version", "v1")
+            version_count = len(line.get("versions", []))
+            rows.append(
+                [
+                    line.get("line_id", ""),
+                    line.get("speaker", ""),
+                    line.get("text", ""),
+                    line.get("status", ""),
+                    line.get("audio_path", ""),
+                    line.get("chunk_count", 0),
+                    selected_version,
+                    version_count,
+                ]
+            )
+        return rows
+
+    def _build_line_choices_from_manifest(self, manifest: Dict[str, Any]) -> List[str]:
+        choices = []
+        for line in manifest.get("lines", []):
+            choices.append(f"{line.get('line_id', '')} | {line.get('speaker', '')}")
+        return choices
+
+    def _parse_line_choice(self, selected_line: str) -> str:
+        return (selected_line or "").split("|", 1)[0].strip()
+
+    def _find_manifest_line(self, manifest: Dict[str, Any], line_id: str) -> Dict[str, Any]:
+        for line in manifest.get("lines", []):
+            if line.get("line_id") == line_id:
+                return line
+        raise ValueError(f"해당 줄을 찾을 수 없습니다: {line_id}")
+
+    def _next_line_version(self, line_entry: Dict[str, Any]) -> Tuple[str, int]:
+        versions = line_entry.get("versions", [])
+        next_index = len(versions) + 1
+        return f"v{next_index}", next_index
+
+    def _render_line_with_prompt(
+        self,
+        text: str,
+        language: str,
+        prompt_path: str,
+        options: PostprocessOptions,
+    ) -> Tuple[np.ndarray, int, int]:
+        items = self._load_voice_prompt_items(prompt_path)
+        wav, sample_rate, chunk_count = self._generate_voice_clone_wav(
+            text=text,
+            language=language,
+            audio_input=None,
+            reference_text=None,
+            x_vector_only_mode=False,
+            voice_clone_prompt=items,
+        )
+        processed_wav = self._apply_postprocess(wav, sample_rate, options)
+        return processed_wav, sample_rate, chunk_count
 
     def _merge_wavs_with_silence(self, wavs: List[np.ndarray], sample_rate: int, silence_ms: int) -> np.ndarray:
         if not wavs:
@@ -561,20 +1075,20 @@ class TTSModel:
         save_line_files: bool = True,
         merge_output: bool = True,
         silence_ms: int = 120,
-    ) -> Tuple[Optional[str], List[str], str, List[List[Any]]]:
+    ) -> Tuple[Optional[str], List[str], str, List[List[Any]], str, gr.Dropdown]:
         if self.model is None:
-            return None, [], "❌ 먼저 TTS 모델을 로드해주세요!", []
+            return None, [], "❌ 먼저 TTS 모델을 로드해주세요!", [], "", gr.Dropdown(choices=[], value=None)
 
         try:
             parsed_lines = self.parse_script_lines(script_text)
             speaker_configs = self._normalize_speaker_rows(speaker_rows)
         except ValueError as exc:
-            return None, [], f"❌ {exc}", []
+            return None, [], f"❌ {exc}", [], "", gr.Dropdown(choices=[], value=None)
 
         missing_speakers = [line.speaker for line in parsed_lines if line.speaker not in speaker_configs]
         if missing_speakers:
             unique_missing = ", ".join(dict.fromkeys(missing_speakers))
-            return None, [], f"❌ 다음 화자에 대한 설정이 없습니다: {unique_missing}", []
+            return None, [], f"❌ 다음 화자에 대한 설정이 없습니다: {unique_missing}", [], "", gr.Dropdown(choices=[], value=None)
 
         job_dir = self._create_multi_speaker_job_dir(job_name or "multi_speaker")
         prompt_cache: Dict[str, Any] = {}
@@ -608,7 +1122,12 @@ class TTSModel:
                 sample_rate_for_merge = sample_rate
                 rendered_wavs.append(processed_wav)
 
-                line_filename = f"{line.line_id}_{self._sanitize_filename_part(line.speaker, 'speaker')}.wav"
+                line_filename = self._build_multi_speaker_filename(
+                    line_index=line.line_index,
+                    speaker=line.speaker,
+                    text=line.text,
+                    version_id="v1",
+                )
                 line_path = os.path.join(job_dir, line_filename)
                 self._save_wav_to_path(processed_wav, sample_rate, line_path)
                 if save_line_files:
@@ -622,6 +1141,8 @@ class TTSModel:
                         "완료",
                         line_path,
                         chunk_count,
+                        "v1",
+                        1,
                     ]
                 )
 
@@ -655,15 +1176,24 @@ class TTSModel:
                         "status": row[3],
                         "audio_path": row[4],
                         "chunk_count": row[5],
+                        "selected_version": row[6],
+                        "versions": [
+                            {
+                                "version_id": row[6],
+                                "audio_path": row[4],
+                                "chunk_count": row[5],
+                                "created_at": datetime.now().isoformat(timespec="seconds"),
+                            }
+                        ],
                     }
                     for row in result_rows
                 ],
                 "final_mix_path": final_mix_path,
             }
-            manifest_path = os.path.join(job_dir, "script_manifest.json")
-            with open(manifest_path, "w", encoding="utf-8") as manifest_file:
-                json.dump(manifest, manifest_file, ensure_ascii=False, indent=2)
+            manifest_path = self._write_manifest(job_dir, manifest)
             output_files.append(manifest_path)
+            line_choices = self._build_line_choices_from_manifest(manifest)
+            line_dropdown = gr.Dropdown(choices=line_choices, value=line_choices[0] if line_choices else None)
 
             summary = (
                 f"✅ 다화자 대본 생성 완료\n"
@@ -671,9 +1201,133 @@ class TTSModel:
                 f"화자 수: {len(speaker_configs)}\n"
                 f"작업 폴더: {job_dir}"
             )
-            return final_mix_path, output_files, summary, result_rows
+            return final_mix_path, output_files, summary, result_rows, job_dir, line_dropdown
         except Exception as exc:
-            return None, output_files, f"❌ 다화자 생성 실패: {type(exc).__name__}: {exc}", result_rows
+            return None, output_files, f"❌ 다화자 생성 실패: {type(exc).__name__}: {exc}", result_rows, job_dir, gr.Dropdown(choices=[], value=None)
+
+    def preview_multi_speaker_line(
+        self,
+        job_dir: str,
+        selected_line: str,
+    ) -> Tuple[Optional[str], str, str, str]:
+        if not job_dir or not str(job_dir).strip():
+            return None, "", "", "❌ 먼저 다화자 대본을 생성해주세요."
+        if not selected_line or not str(selected_line).strip():
+            return None, "", "", "❌ 미리들을 줄을 선택해주세요."
+
+        try:
+            manifest = self._read_manifest(job_dir)
+            line_id = self._parse_line_choice(selected_line)
+            line_entry = self._find_manifest_line(manifest, line_id)
+            audio_path = line_entry.get("audio_path")
+            if not audio_path or not os.path.exists(audio_path):
+                return None, line_entry.get("speaker", ""), line_entry.get("text", ""), "❌ 선택한 줄의 오디오 파일이 없습니다."
+            status = (
+                f"✅ {line_entry.get('line_id')} 미리듣기 준비 완료\n"
+                f"화자: {line_entry.get('speaker')}\n"
+                f"선택 버전: {line_entry.get('selected_version', 'v1')}"
+            )
+            return audio_path, line_entry.get("speaker", ""), line_entry.get("text", ""), status
+        except Exception as exc:
+            return None, "", "", f"❌ 줄 미리듣기 실패: {type(exc).__name__}: {exc}"
+
+    def regenerate_multi_speaker_line(
+        self,
+        job_dir: str,
+        selected_line: str,
+        speaker_rows,
+        language: str,
+        merge_output: bool = True,
+        silence_ms: int = 120,
+    ) -> Tuple[Optional[str], Optional[str], List[str], str, List[List[Any]], gr.Dropdown]:
+        if self.model is None:
+            return None, None, [], "❌ 먼저 TTS 모델을 로드해주세요!", [], gr.Dropdown(choices=[], value=None)
+        if not job_dir or not str(job_dir).strip():
+            return None, None, [], "❌ 먼저 다화자 대본을 생성해주세요.", [], gr.Dropdown(choices=[], value=None)
+        if not selected_line or not str(selected_line).strip():
+            return None, None, [], "❌ 다시 생성할 줄을 선택해주세요.", [], gr.Dropdown(choices=[], value=None)
+
+        try:
+            speaker_configs = self._normalize_speaker_rows(speaker_rows)
+            manifest = self._read_manifest(job_dir)
+            line_id = self._parse_line_choice(selected_line)
+            line_entry = self._find_manifest_line(manifest, line_id)
+            speaker = line_entry.get("speaker", "")
+            if speaker not in speaker_configs:
+                raise ValueError(f"화자 '{speaker}'의 설정이 현재 표에 없습니다.")
+
+            speaker_config = speaker_configs[speaker]
+            version_id, version_index = self._next_line_version(line_entry)
+            processed_wav, sample_rate, chunk_count = self._render_line_with_prompt(
+                text=line_entry.get("text", ""),
+                language=language,
+                prompt_path=speaker_config["prompt_path"],
+                options=speaker_config["options"],
+            )
+            line_number = int(re.sub(r"\D", "", line_id) or "0")
+            file_name = self._build_multi_speaker_filename(
+                line_index=line_number,
+                speaker=speaker,
+                text=line_entry.get("text", ""),
+                version_id=version_id,
+            )
+            line_path = os.path.join(job_dir, file_name)
+            self._save_wav_to_path(processed_wav, sample_rate, line_path)
+
+            line_entry["audio_path"] = line_path
+            line_entry["chunk_count"] = chunk_count
+            line_entry["status"] = "완료"
+            line_entry["selected_version"] = version_id
+            line_entry.setdefault("versions", []).append(
+                {
+                    "version_id": version_id,
+                    "audio_path": line_path,
+                    "chunk_count": chunk_count,
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
+            manifest["speakers"] = {
+                speaker_name: {
+                    "prompt_path": config["prompt_path"],
+                    "options": asdict(config["options"]),
+                }
+                for speaker_name, config in speaker_configs.items()
+            }
+
+            output_files = [line_path]
+            final_mix_path = manifest.get("final_mix_path")
+            if merge_output:
+                merged_wavs: List[np.ndarray] = []
+                sample_rate_for_merge: Optional[int] = None
+                for manifest_line in manifest.get("lines", []):
+                    current_path = manifest_line.get("audio_path")
+                    if not current_path or not os.path.exists(current_path):
+                        raise ValueError(f"합본에 필요한 줄 파일이 없습니다: {manifest_line.get('line_id')}")
+                    wav, current_sr = sf.read(current_path, dtype="float32")
+                    if wav.ndim > 1:
+                        wav = wav.mean(axis=1)
+                    sample_rate_for_merge = current_sr
+                    merged_wavs.append(wav.astype(np.float32))
+                if sample_rate_for_merge is not None:
+                    merged_wav = self._merge_wavs_with_silence(merged_wavs, sample_rate_for_merge, silence_ms)
+                    final_mix_path = os.path.join(job_dir, "final_mix.wav")
+                    self._save_wav_to_path(merged_wav, sample_rate_for_merge, final_mix_path)
+                    manifest["final_mix_path"] = final_mix_path
+                    output_files.append(final_mix_path)
+
+            manifest_path = self._write_manifest(job_dir, manifest)
+            output_files.append(manifest_path)
+            result_rows = self._build_result_rows_from_manifest(manifest)
+            line_choices = self._build_line_choices_from_manifest(manifest)
+            line_dropdown = gr.Dropdown(choices=line_choices, value=selected_line if selected_line in line_choices else (line_choices[0] if line_choices else None))
+            status = (
+                f"✅ {line_id} 다시 생성 완료\n"
+                f"화자: {speaker}\n"
+                f"새 버전: {version_id} ({version_index}번째 렌더)"
+            )
+            return line_path, final_mix_path, output_files, status, result_rows, line_dropdown
+        except Exception as exc:
+            return None, None, [], f"❌ 줄 다시 생성 실패: {type(exc).__name__}: {exc}", [], gr.Dropdown(choices=[], value=None)
 
     def _generate_voice_clone_wav(
         self,
