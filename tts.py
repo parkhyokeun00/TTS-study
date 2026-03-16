@@ -1003,6 +1003,32 @@ class TTSModel:
             raise ValueError("manifest 형식이 올바르지 않습니다.")
         return payload
 
+    def _sync_manifest_script_text(self, job_dir: str, manifest: Dict[str, Any]) -> Optional[str]:
+        lines = manifest.get("lines", [])
+        if not isinstance(lines, list):
+            return None
+
+        if manifest.get("paragraph_mode"):
+            script_text = "\n\n".join((str(line.get("text", "")).strip()) for line in lines if str(line.get("text", "")).strip())
+        else:
+            script_rows: List[str] = []
+            for line in lines:
+                speaker = str(line.get("speaker", "")).strip()
+                text = str(line.get("text", "")).strip()
+                if not text:
+                    continue
+                script_rows.append(f"{speaker}: {text}" if speaker else text)
+            script_text = "\n".join(script_rows)
+
+        manifest["script_text"] = script_text
+        script_path = os.path.join(job_dir, "script.txt")
+        with open(script_path, "w", encoding="utf-8") as script_file:
+            if script_text.strip():
+                script_file.write(script_text.strip() + "\n")
+            else:
+                script_file.write("")
+        return script_path
+
     def _build_result_rows_from_manifest(self, manifest: Dict[str, Any]) -> List[List[Any]]:
         rows: List[List[Any]] = []
         for line in manifest.get("lines", []):
@@ -1039,7 +1065,11 @@ class TTSModel:
 
     def _next_line_version(self, line_entry: Dict[str, Any]) -> Tuple[str, int]:
         versions = line_entry.get("versions", [])
-        next_index = len(versions) + 1
+        next_index = 1
+        for version in versions:
+            match = re.fullmatch(r"v(\d+)", str(version.get("version_id", "")).strip())
+            if match:
+                next_index = max(next_index, int(match.group(1)) + 1)
         return f"v{next_index}", next_index
 
     def _render_line_with_prompt(
@@ -1231,6 +1261,29 @@ class TTSModel:
         except Exception as exc:
             return None, "", "", f"❌ 줄 미리듣기 실패: {type(exc).__name__}: {exc}"
 
+    def get_multi_speaker_line_editor_values(
+        self,
+        job_dir: str,
+        selected_line: str,
+    ) -> Tuple[str, str, str]:
+        if not job_dir or not str(job_dir).strip():
+            return "", "", "먼저 다화자 대본을 생성해주세요."
+        if not selected_line or not str(selected_line).strip():
+            return "", "", "줄을 선택하면 대사와 화자 정보를 불러옵니다."
+
+        try:
+            manifest = self._read_manifest(job_dir)
+            line_id = self._parse_line_choice(selected_line)
+            line_entry = self._find_manifest_line(manifest, line_id)
+            status = (
+                f"✅ {line_entry.get('line_id')} 편집 준비 완료\n"
+                f"화자: {line_entry.get('speaker', '')}\n"
+                f"선택 버전: {line_entry.get('selected_version', 'v1')}"
+            )
+            return line_entry.get("speaker", ""), line_entry.get("text", ""), status
+        except Exception as exc:
+            return "", "", f"❌ 줄 정보 불러오기 실패: {type(exc).__name__}: {exc}"
+
     def get_regenerate_line_defaults(
         self,
         job_dir: str,
@@ -1268,6 +1321,7 @@ class TTSModel:
         selected_line: str,
         speaker_rows,
         language: str,
+        edited_text: str,
         merge_output: bool = True,
         silence_ms: int = 120,
         speed: float = 1.0,
@@ -1290,6 +1344,9 @@ class TTSModel:
             speaker = line_entry.get("speaker", "")
             if speaker not in speaker_configs:
                 raise ValueError(f"화자 '{speaker}'의 설정이 현재 표에 없습니다.")
+            new_text = str(edited_text or "").strip()
+            if not new_text:
+                raise ValueError("선택 줄 대사가 비어 있습니다.")
 
             speaker_config = speaker_configs[speaker]
             override_options = PostprocessOptions(
@@ -1298,9 +1355,11 @@ class TTSModel:
                 ending_style=str(ending_style),
                 ending_length_ms=int(ending_length_ms),
             )
+            previous_text = str(line_entry.get("text", ""))
+            line_entry["text"] = new_text
             version_id, version_index = self._next_line_version(line_entry)
             processed_wav, sample_rate, chunk_count = self._render_line_with_prompt(
-                text=line_entry.get("text", ""),
+                text=new_text,
                 language=language,
                 prompt_path=speaker_config["prompt_path"],
                 options=override_options,
@@ -1309,17 +1368,32 @@ class TTSModel:
             file_name = self._build_multi_speaker_filename(
                 line_index=line_number,
                 speaker=speaker,
-                text=line_entry.get("text", ""),
+                text=new_text,
                 version_id=version_id,
             )
             line_path = os.path.join(job_dir, file_name)
             self._save_wav_to_path(processed_wav, sample_rate, line_path)
 
+            removed_version_count = 0
+            kept_versions: List[Dict[str, Any]] = []
+            for version in line_entry.get("versions", []):
+                version_id_text = str(version.get("version_id", "")).strip()
+                audio_path = str(version.get("audio_path", "")).strip()
+                if version_id_text == "v1":
+                    kept_versions.append(version)
+                    continue
+                if audio_path and os.path.exists(audio_path):
+                    try:
+                        os.remove(audio_path)
+                    except OSError:
+                        pass
+                removed_version_count += 1
+
             line_entry["audio_path"] = line_path
             line_entry["chunk_count"] = chunk_count
             line_entry["status"] = "완료"
             line_entry["selected_version"] = version_id
-            line_entry.setdefault("versions", []).append(
+            kept_versions.append(
                 {
                     "version_id": version_id,
                     "audio_path": line_path,
@@ -1327,6 +1401,7 @@ class TTSModel:
                     "created_at": datetime.now().isoformat(timespec="seconds"),
                 }
             )
+            line_entry["versions"] = kept_versions
             manifest["speakers"] = {
                 speaker_name: {
                     "prompt_path": config["prompt_path"],
@@ -1336,6 +1411,9 @@ class TTSModel:
             }
 
             output_files = [line_path]
+            script_path = self._sync_manifest_script_text(job_dir, manifest)
+            if script_path:
+                output_files.append(script_path)
             final_mix_path = manifest.get("final_mix_path")
             if merge_output:
                 merged_wavs: List[np.ndarray] = []
@@ -1367,6 +1445,10 @@ class TTSModel:
                 f"새 버전: {version_id} ({version_index}번째 렌더)\n"
                 f"적용값: speed={override_options.speed:.2f}, pitch={override_options.pitch_semitones:.1f}, ending={override_options.ending_style}"
             )
+            if previous_text != new_text:
+                status += "\n대사 수정 반영 완료"
+            if removed_version_count:
+                status += f"\n이전 재생성본 {removed_version_count}개 정리 완료"
             return line_path, final_mix_path, output_files, status, result_rows, line_dropdown
         except Exception as exc:
             return None, None, [], f"❌ 줄 다시 생성 실패: {type(exc).__name__}: {exc}", [], gr.Dropdown(choices=[], value=None)

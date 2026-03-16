@@ -773,7 +773,12 @@ def create_app():
                     multi_line_audio = gr.Audio(label="선택 줄 오디오", type="filepath")
                     with gr.Row():
                         multi_line_speaker = gr.Textbox(label="선택 줄 화자", interactive=False)
-                        multi_line_text = gr.Textbox(label="선택 줄 대사", interactive=False, lines=3)
+                        multi_line_text = gr.Textbox(
+                            label="선택 줄 대사",
+                            interactive=True,
+                            lines=3,
+                            info="여기서 대사를 수정한 뒤 다시 생성할 수 있습니다.",
+                        )
                     with gr.Row():
                         multi_regen_speed = gr.Slider(
                             minimum=0.7,
@@ -1052,6 +1057,12 @@ def create_app():
         )
 
         multi_line_selector.change(
+            fn=tts_model.get_multi_speaker_line_editor_values,
+            inputs=[multi_job_dir_state, multi_line_selector],
+            outputs=[multi_line_speaker, multi_line_text, multi_line_status],
+        )
+
+        multi_line_selector.change(
             fn=tts_model.get_regenerate_line_defaults,
             inputs=[multi_job_dir_state, multi_line_selector, multi_speaker_table],
             outputs=[multi_regen_speed, multi_regen_pitch, multi_regen_ending_style, multi_regen_ending_length, multi_line_status],
@@ -1064,6 +1075,7 @@ def create_app():
                 multi_line_selector,
                 multi_speaker_table,
                 language_dropdown,
+                multi_line_text,
                 multi_make_mix,
                 multi_silence_ms,
                 multi_regen_speed,
